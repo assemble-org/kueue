@@ -147,10 +147,20 @@ func ValidateElasticJobAnnotation(obj client.Object, gvk schema.GroupVersionKind
 	if !workloadslicing.Enabled(obj) {
 		return allErrs
 	}
-	if !supportedElasticJobGVKs.Has(gvk.String()) {
+	if !elasticJobKindSupported(gvk) {
 		allErrs = append(allErrs, field.Forbidden(elasticJobAnnotationPath, fmt.Sprintf("elastic job is not supported for %q", gvk)))
 	}
 	return allErrs
+}
+
+// elasticJobKindSupported reports whether gvk may carry the elastic-job annotation.
+// Plain Pods qualify only behind ElasticJobsViaWorkloadSlicesForPodGroups.
+func elasticJobKindSupported(gvk schema.GroupVersionKind) bool {
+	if supportedElasticJobGVKs.Has(gvk.String()) {
+		return true
+	}
+	return features.Enabled(features.ElasticJobsViaWorkloadSlicesForPodGroups) &&
+		gvk == corev1.SchemeGroupVersion.WithKind("Pod")
 }
 
 // validateElasticJobScaleUpStrategyAnnotation validates kueue.x-k8s.io/elastic-job-scale-up-strategy

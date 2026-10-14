@@ -234,6 +234,18 @@ func FindNotFinishedWorkloads(ctx context.Context, clnt client.Client, jobObject
 	return sortAndFilterNotFinishedWorkloads(list.Items), nil
 }
 
+// FindNotFinishedWorkloadsForSlice is FindNotFinishedWorkloads for a chain keyed by
+// its slice name instead of an owner reference.
+func FindNotFinishedWorkloadsForSlice(ctx context.Context, clnt client.Client, namespace, sliceName string) ([]kueue.Workload, error) {
+	list := &kueue.WorkloadList{}
+	if err := clnt.List(ctx, list, client.InNamespace(namespace),
+		client.MatchingFields{indexer.WorkloadSliceNameKey: sliceName}); err != nil {
+		return nil, err
+	}
+
+	return sortAndFilterNotFinishedWorkloads(list.Items), nil
+}
+
 // FindLatestAdmittedWorkload returns the latest admitted slice in wl's chain,
 // or nil if wl is nil or the chain has no admitted slice.
 // excludeVariants lets scheduling observation select only Parent slices.
@@ -265,12 +277,26 @@ func FindLatestActiveWorkload(ctx context.Context, clnt client.Client, jobObject
 	if err != nil {
 		return nil, err
 	}
+	return latestActiveWorkload(workloads), nil
+}
+
+// FindLatestActiveWorkloadForSlice is FindLatestActiveWorkload for a chain keyed by
+// its slice name instead of an owner reference.
+func FindLatestActiveWorkloadForSlice(ctx context.Context, clnt client.Client, namespace, sliceName string) (*kueue.Workload, error) {
+	workloads, err := FindNotFinishedWorkloadsForSlice(ctx, clnt, namespace, sliceName)
+	if err != nil {
+		return nil, err
+	}
+	return latestActiveWorkload(workloads), nil
+}
+
+func latestActiveWorkload(workloads []kueue.Workload) *kueue.Workload {
 	for i := range slices.Backward(workloads) {
 		if workload.HasQuotaReservation(&workloads[i]) && !workloadevict.IsEvicted(&workloads[i]) {
-			return &workloads[i], nil
+			return &workloads[i]
 		}
 	}
-	return nil, nil
+	return nil
 }
 
 // ScaledDown returns true if the new pod sets represent a scale-down operation.
