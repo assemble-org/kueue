@@ -50,6 +50,9 @@ func IgnoreUndeclaredResources(quotaCheckStrategy configapi.QuotaCheckStrategy) 
 }
 
 func mostSevereReason(a, b string) string {
+	if a == "" {
+		return b
+	}
 	if reasonSeverity(a) >= reasonSeverity(b) {
 		return a
 	}
@@ -62,10 +65,13 @@ const (
 	reasonSeverityWaitingForQuota
 	reasonSeverityExceedsMaxQuota
 	reasonSeverityNoMatchingFlavor
+	reasonSeverityAssignmentError
 )
 
 func reasonSeverity(reason string) int {
 	switch reason {
+	case kueue.WorkloadQuotaReservedReasonAssignmentError:
+		return reasonSeverityAssignmentError
 	case kueue.WorkloadQuotaReservedReasonNoMatchingFlavor:
 		return reasonSeverityNoMatchingFlavor
 	case kueue.WorkloadQuotaReservedReasonExceedsMaxQuota:

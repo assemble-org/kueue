@@ -322,6 +322,12 @@ func (a *Assignment) TotalRequestsFor(log logr.Logger, wl *workload.Info) resour
 
 func (a *Assignment) psError(psAssignment *PodSetAssignment, err error) {
 	psAssignment.error(err)
+	// The flavors fit, so no attempt carries a NoFit reason; without one the
+	// Workload's QuotaReserved condition is patched with an empty reason, which
+	// the API rejects, and the condition keeps whatever it said last.
+	if psAssignment.Status.noFitReason == "" {
+		psAssignment.Status.noFitReason = kueue.WorkloadQuotaReservedReasonAssignmentError
+	}
 	a.representativeMode = nil
 }
 
@@ -375,6 +381,11 @@ func (a *Assignment) ResolveNoFitReason(cq *schdcache.ClusterQueueSnapshot) {
 
 	for _, ps := range a.PodSets {
 		if ps.RepresentativeMode() != NoFit {
+			continue
+		}
+		// An error is the PodSet's reason whatever its flavor attempts say.
+		if ps.Status.IsError() && ps.Status.noFitReason != "" {
+			overallReason = mostSevereReason(overallReason, ps.Status.noFitReason)
 			continue
 		}
 		if len(ps.FlavorAssignmentAttempts) == 0 {
