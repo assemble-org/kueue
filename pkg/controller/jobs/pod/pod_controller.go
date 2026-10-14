@@ -754,22 +754,31 @@ func (p *Pod) WorkloadSliceName() string {
 	return utilpod.GetPodGroupName(&p.pod)
 }
 
-// groupMinCount returns the value of GroupMinCountAnnotation for the pod being
-// reconciled, and whether the annotation is present.
-func (p *Pod) groupMinCount() (int, bool, error) {
-	value, found := p.Object().GetAnnotations()[podconstants.GroupMinCountAnnotation]
+// groupMinCount returns a member's GroupMinCountAnnotation value, and whether the
+// annotation is present.
+func groupMinCount(pod *corev1.Pod) (int, bool, error) {
+	return positiveCountAnnotation(pod, podconstants.GroupMinCountAnnotation)
+}
+
+// groupRoleCount returns a member's GroupRoleCountAnnotation value, and whether the
+// annotation is present.
+func groupRoleCount(pod *corev1.Pod) (int, bool, error) {
+	return positiveCountAnnotation(pod, podconstants.GroupRoleCountAnnotation)
+}
+
+func positiveCountAnnotation(pod *corev1.Pod, key string) (int, bool, error) {
+	value, found := pod.GetAnnotations()[key]
 	if !found {
 		return 0, false, nil
 	}
-	minCount, err := strconv.Atoi(value)
+	count, err := strconv.Atoi(value)
 	if err != nil {
-		return 0, true, fmt.Errorf("incorrect annotation value '%s=%s': %w", podconstants.GroupMinCountAnnotation, value, err)
+		return 0, true, fmt.Errorf("incorrect annotation value '%s=%s': %w", key, value, err)
 	}
-	if minCount < 1 {
-		return 0, true, fmt.Errorf("incorrect annotation value '%s=%s': group min count should be greater than zero",
-			podconstants.GroupMinCountAnnotation, value)
+	if count < 1 {
+		return 0, true, fmt.Errorf("incorrect annotation value '%s=%s': should be greater than zero", key, value)
 	}
-	return minCount, true, nil
+	return count, true, nil
 }
 
 // groupTotalCount returns the value of GroupTotalCountAnnotation for the pod being reconciled at the moment.
@@ -938,8 +947,16 @@ func (p *Pod) constructGroupPodSets(referenceOrder []kueue.PodSetReference) ([]k
 
 		templatePods := p.list.Items
 		if p.isElasticGroupMember() {
-			if err := p.validateSingleRole(); err != nil {
+			roles, err := p.elasticRoles()
+			if err != nil {
 				return nil, err
+			}
+			if len(roles) > 1 {
+				rolePodSets, err := p.constructElasticRolePodSets(roles, tc)
+				if err != nil {
+					return nil, err
+				}
+				return p.applyGroupMinCount(reorderPodSets(rolePodSets, referenceOrder))
 			}
 			templatePods = gatedMembersFirst(p.list.Items)
 		}
@@ -960,26 +977,67 @@ func (p *Pod) constructGroupPodSets(referenceOrder []kueue.PodSetReference) ([]k
 	return p.applyGroupMinCount(podSets)
 }
 
-// validateSingleRole rejects an elastic group whose runnable members have more than
-// one role: the slice is one PodSet sized by the group total count, and the group
-// minimum is one number for the whole group.
-func (p *Pod) validateSingleRole() error {
-	roles := sets.New[string]()
+// elasticRole is one role of an elastic group with its runnable members.
+type elasticRole struct {
+	hash string
+	pods []corev1.Pod
+}
+
+// elasticRoles groups the runnable members by role, in order of first appearance.
+func (p *Pod) elasticRoles() ([]elasticRole, error) {
+	var roles []elasticRole
+	index := make(map[string]int)
 	for i := range p.list.Items {
-		if !isPodRunnableOrSucceeded(&p.list.Items[i]) {
+		pod := &p.list.Items[i]
+		if !isPodRunnableOrSucceeded(pod) {
 			continue
 		}
-		roleHash, err := getRoleHash(p.list.Items[i])
+		hash, err := getRoleHash(*pod)
 		if err != nil {
-			return fmt.Errorf("failed to calculate pod role hash: %w", err)
+			return nil, fmt.Errorf("failed to calculate pod role hash: %w", err)
 		}
-		roles.Insert(roleHash)
+		at, seen := index[hash]
+		if !seen {
+			at = len(roles)
+			index[hash] = at
+			roles = append(roles, elasticRole{hash: hash})
+		}
+		roles[at].pods = append(roles[at].pods, *pod)
 	}
-	if roles.Len() > 1 {
-		return jobframework.UnretryableError(fmt.Sprintf("elastic pod group '%s' has %d roles; an elastic group needs a single role",
-			utilpod.GetPodGroupName(&p.pod), roles.Len()))
+	return roles, nil
+}
+
+// constructElasticRolePodSets builds one PodSet per role for an elastic group with
+// several roles, one per clique-slice. A role's count comes from its members'
+// GroupRoleCountAnnotation and the role counts add up to the group total count.
+func (p *Pod) constructElasticRolePodSets(roles []elasticRole, groupTotalCount int) ([]kueue.PodSet, error) {
+	groupName := utilpod.GetPodGroupName(&p.pod)
+	podSets := make([]kueue.PodSet, 0, len(roles))
+	sum := 0
+	for _, role := range roles {
+		count, found, err := groupRoleCount(&role.pods[0])
+		if err != nil {
+			return nil, jobframework.UnretryableError(err.Error())
+		}
+		if !found {
+			return nil, jobframework.UnretryableError(fmt.Sprintf("elastic pod group '%s' has %d roles; every member needs the '%s' annotation",
+				groupName, len(roles), podconstants.GroupRoleCountAnnotation))
+		}
+		members := gatedMembersFirst(role.pods)
+		rolePodSets, err := constructPodSets(&members[0])
+		if err != nil {
+			return nil, err
+		}
+		rolePodSets[0].Name = kueue.NewPodSetReference(role.hash)
+		rolePodSets[0].Count = int32(count)
+		podSets = append(podSets, rolePodSets[0])
+		sum += count
 	}
-	return nil
+	if sum != groupTotalCount {
+		return nil, jobframework.UnretryableError(fmt.Sprintf("elastic pod group '%s': the role counts add up to %d, the group total count is %d",
+			groupName, sum, groupTotalCount))
+	}
+	return podSets, nil
 }
 
 // gatedMembersFirst orders the members still holding the elastic-job gate ahead
@@ -1001,20 +1059,41 @@ func gatedMembersFirst(pods []corev1.Pod) []corev1.Pod {
 	return ordered
 }
 
+// roleMember returns a runnable member of the role a PodSet is named after.
+func (p *Pod) roleMember(roleHash string) *corev1.Pod {
+	for i := range p.list.Items {
+		pod := &p.list.Items[i]
+		if !isPodRunnableOrSucceeded(pod) {
+			continue
+		}
+		if hash, err := getRoleHash(*pod); err == nil && hash == roleHash {
+			return pod
+		}
+	}
+	return nil
+}
+
 // applyGroupMinCount turns an elastic group's minimum into the PodSet floor the
-// scheduler may partially admit down to.
+// scheduler may partially admit down to. With several roles each role's members
+// carry the minimum of their own PodSet.
 func (p *Pod) applyGroupMinCount(podSets []kueue.PodSet) ([]kueue.PodSet, error) {
 	if !p.isElasticGroupMember() {
 		return podSets, nil
 	}
-	minCount, found, err := p.groupMinCount()
-	if err != nil {
-		return nil, jobframework.UnretryableError(err.Error())
+	for i := range podSets {
+		member := p.roleMember(string(podSets[i].Name))
+		if member == nil {
+			continue
+		}
+		minCount, found, err := groupMinCount(member)
+		if err != nil {
+			return nil, jobframework.UnretryableError(err.Error())
+		}
+		if !found {
+			continue
+		}
+		podSets[i].MinCount = ptr.To(min(int32(minCount), podSets[i].Count))
 	}
-	if !found || len(podSets) != 1 {
-		return podSets, nil
-	}
-	podSets[0].MinCount = ptr.To(min(int32(minCount), podSets[0].Count))
 	return podSets, nil
 }
 
@@ -1310,6 +1389,8 @@ func (p *Pod) validatePodGroupMetadata(r events.EventRecorder, activePods []core
 		return jobframework.UnretryableError(errMsg)
 	}
 
+	// Every member of a role agrees on the role's minimum and count.
+	roleMetadata := make(map[string]elasticRoleMetadata)
 	for _, podInGroup := range p.list.Items {
 		// Skip failed pods
 		if podInGroup.Status.Phase == corev1.PodFailed {
@@ -1337,17 +1418,34 @@ func (p *Pod) validatePodGroupMetadata(r events.EventRecorder, activePods []core
 		}
 
 		if p.isElasticGroupMember() {
-			groupMinCount := p.pod.GetAnnotations()[podconstants.GroupMinCountAnnotation]
-			if podMinCount := podInGroup.GetAnnotations()[podconstants.GroupMinCountAnnotation]; podMinCount != groupMinCount {
-				return jobframework.UnretryableError(fmt.Sprintf("pods '%s' and '%s' has different '%s' values: %q!=%q",
-					p.pod.GetName(), podInGroup.GetName(),
-					podconstants.GroupMinCountAnnotation,
-					groupMinCount, podMinCount))
+			role, err := getRoleHash(podInGroup)
+			if err != nil {
+				return fmt.Errorf("failed to calculate pod role hash: %w", err)
+			}
+			meta := elasticRoleMetadata{
+				pod:       podInGroup.GetName(),
+				minCount:  podInGroup.GetAnnotations()[podconstants.GroupMinCountAnnotation],
+				roleCount: podInGroup.GetAnnotations()[podconstants.GroupRoleCountAnnotation],
+			}
+			if seen, ok := roleMetadata[role]; !ok {
+				roleMetadata[role] = meta
+			} else if seen.minCount != meta.minCount || seen.roleCount != meta.roleCount {
+				return jobframework.UnretryableError(fmt.Sprintf("pods '%s' and '%s' of one role have different '%s' / '%s' values: %q / %q != %q / %q",
+					seen.pod, meta.pod,
+					podconstants.GroupMinCountAnnotation, podconstants.GroupRoleCountAnnotation,
+					seen.minCount, seen.roleCount, meta.minCount, meta.roleCount))
 			}
 		}
 	}
 
 	return nil
+}
+
+// elasticRoleMetadata is the per-role part of an elastic member's annotations.
+type elasticRoleMetadata struct {
+	pod       string
+	minCount  string
+	roleCount string
 }
 
 // partitionPods splits pods in the group into active and inactive pods
