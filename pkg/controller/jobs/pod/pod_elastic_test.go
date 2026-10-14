@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
 	podconstants "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
 	"sigs.k8s.io/kueue/pkg/features"
+	"sigs.k8s.io/kueue/pkg/podset"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
 	"sigs.k8s.io/kueue/pkg/workloadslicing"
@@ -349,6 +350,53 @@ func TestPodsReadyElasticGroup(t *testing.T) {
 			group := elasticGroup(append(readyMembers(), tc.fourth)...)
 			if got := group.PodsReady(ctx, nil); got != tc.want {
 				t.Errorf("PodsReady() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("nothing released yet keeps the group not ready", func(t *testing.T) {
+		features.SetFeatureGatesDuringTest(t, elasticGroupGates)
+		ctx, _ := utiltesting.ContextWithLog(t)
+		var members []*corev1.Pod
+		for i := range 4 {
+			members = append(members, elasticGroupMember(fmt.Sprintf("grp-%d", i)).Gate(kueue.ElasticJobSchedulingGate).Obj())
+		}
+		if elasticGroup(members...).PodsReady(ctx, nil) {
+			t.Error("PodsReady() = true for a group whose members are all still elastic-gated, want false")
+		}
+	})
+}
+
+func TestPrepareNeverAddsSchedulingGates(t *testing.T) {
+	tasInfo := podset.PodSetInfo{Name: "role-a", SchedulingGates: []corev1.PodSchedulingGate{{Name: kueue.TopologySchedulingGate}}}
+	plainInfo := podset.PodSetInfo{Name: "role-a"}
+	testCases := map[string]struct {
+		pod       *corev1.Pod
+		info      podset.PodSetInfo
+		wantGates []corev1.PodSchedulingGate
+	}{
+		"a topology gate the ungater already removed is not re-added": {
+			pod:  testingpod.MakePod("p", "ns").KueueSchedulingGate().Obj(),
+			info: tasInfo,
+		},
+		"the topology gate is kept while the admission uses TAS": {
+			pod:       testingpod.MakePod("p", "ns").KueueSchedulingGate().TopologySchedulingGate().Obj(),
+			info:      tasInfo,
+			wantGates: []corev1.PodSchedulingGate{{Name: kueue.TopologySchedulingGate}},
+		},
+		"the topology gate is removed when the admission does not use TAS": {
+			pod:  testingpod.MakePod("p", "ns").KueueSchedulingGate().TopologySchedulingGate().Obj(),
+			info: plainInfo,
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			_, log := utiltesting.ContextWithLog(t)
+			if err := prepare(log, tc.pod, tc.info); err != nil {
+				t.Fatalf("prepare() error = %v", err)
+			}
+			if diff := cmp.Diff(tc.wantGates, tc.pod.Spec.SchedulingGates, cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("scheduling gates mismatch (-want,+got):\n%s", diff)
 			}
 		})
 	}

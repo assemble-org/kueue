@@ -566,12 +566,16 @@ func (p *Pod) PodsReady(ctx context.Context, _ client.Client) bool {
 		}
 	}
 	// A member the elastic ungater has not released is not expected to be ready:
-	// the active slice was admitted without it.
+	// the active slice was admitted without it. Until it has released anyone,
+	// nothing is expected to be ready either.
 	if p.isElasticGroupMember() {
 		for i := range p.list.Items {
 			if utilpod.HasGate(&p.list.Items[i], kueue.ElasticJobSchedulingGate) {
 				tc--
 			}
+		}
+		if tc <= 0 {
+			return false
 		}
 	}
 	notReady := tc - readyCount
@@ -1001,11 +1005,17 @@ func (p *Pod) releaseWorkloadSlices(ctx context.Context, c client.Client) error 
 		return err
 	}
 	for i := range slices.Items {
-		if !slices.Items[i].DeletionTimestamp.IsZero() {
+		slice := &slices.Items[i]
+		if controllerutil.RemoveFinalizer(slice, kueue.ResourceInUseFinalizerName) {
+			if err := client.IgnoreNotFound(c.Update(ctx, slice)); err != nil {
+				return err
+			}
+		}
+		if !slice.DeletionTimestamp.IsZero() {
 			continue
 		}
-		ctrl.LoggerFrom(ctx).V(2).Info("Deleting the workload slice of a terminating elastic pod group", "workload", klog.KObj(&slices.Items[i]))
-		if err := client.IgnoreNotFound(c.Delete(ctx, &slices.Items[i])); err != nil {
+		ctrl.LoggerFrom(ctx).V(2).Info("Deleting the workload slice of a terminating elastic pod group", "workload", klog.KObj(slice))
+		if err := client.IgnoreNotFound(c.Delete(ctx, slice)); err != nil {
 			return err
 		}
 	}
@@ -1711,14 +1721,23 @@ func (p *Pod) ListChildWorkloads(ctx context.Context, c client.Client, key types
 
 	workloads := &kueue.WorkloadList{}
 
-	// Get related workloads for the pod group
+	// Get related workloads for the pod group. A plain group has one Workload named
+	// after the group; an elastic group has a chain whose slices carry the group name
+	// as their slice name. The slice-name index covers both, since it falls back to
+	// the Workload name, and it does not need a member pod to tell the two apart.
 	if p.isGroup {
-		if p.isElasticGroupMember() {
-			// Every slice of the chain carries the group name as its slice name.
-			if err := c.List(ctx, workloads, client.InNamespace(key.Namespace),
+		if features.Enabled(features.ElasticJobsViaWorkloadSlicesForPodGroups) {
+			chain := &kueue.WorkloadList{}
+			if err := c.List(ctx, chain, client.InNamespace(key.Namespace),
 				client.MatchingFields{indexer.WorkloadSliceNameKey: key.Name}); err != nil {
-				log.Error(err, "Unable to list the workload slices of the pod group")
+				log.Error(err, "Unable to list the workloads of the pod group")
 				return nil, err
+			}
+			for i := range chain.Items {
+				if isForeignGroupWorkload(log, &chain.Items[i]) {
+					continue
+				}
+				workloads.Items = append(workloads.Items, chain.Items[i])
 			}
 			return workloads, nil
 		}
@@ -1730,17 +1749,7 @@ func (p *Pod) ListChildWorkloads(ctx context.Context, c client.Client, key types
 			log.Error(err, "Unable to get related workload for the pod group")
 			return nil, err
 		}
-
-		// A Workload that merely shares the pod group name may belong to another job.
-		// Treating it as this group's child would strip its finalizer and release its
-		// quota. Workloads built by NewGroupWorkload carry the is-group-workload marker,
-		// and a pod group only ever adds non-controller owner references, so a controller
-		// reference means the Workload is owned by someone else.
-		if features.Enabled(features.PodIntegrationValidateGroupOwner) &&
-			workload.Annotations[podconstants.IsGroupWorkloadAnnotationKey] != podconstants.IsGroupWorkloadAnnotationValue &&
-			metav1.GetControllerOfNoCopy(workload) != nil {
-			log.V(2).Info("Existing workload with the pod group name is owned by another controller; not finalizing",
-				"workload", klog.KObj(workload))
+		if isForeignGroupWorkload(log, workload) {
 			return workloads, nil
 		}
 
@@ -1756,6 +1765,22 @@ func (p *Pod) ListChildWorkloads(ctx context.Context, c client.Client, key types
 	}
 
 	return workloads, nil
+}
+
+// isForeignGroupWorkload reports whether a Workload that merely shares the pod group
+// name belongs to another job. Treating it as this group's child would strip its
+// finalizer and release its quota. Workloads built by NewGroupWorkload carry the
+// is-group-workload marker, and a pod group only ever adds non-controller owner
+// references, so a controller reference means the Workload is owned by someone else.
+func isForeignGroupWorkload(log logr.Logger, workload *kueue.Workload) bool {
+	if features.Enabled(features.PodIntegrationValidateGroupOwner) &&
+		workload.Annotations[podconstants.IsGroupWorkloadAnnotationKey] != podconstants.IsGroupWorkloadAnnotationValue &&
+		metav1.GetControllerOfNoCopy(workload) != nil {
+		log.V(2).Info("Existing workload with the pod group name is owned by another controller; not finalizing",
+			"workload", klog.KObj(workload))
+		return true
+	}
+	return false
 }
 
 func (p *Pod) FindMatchingWorkloads(ctx context.Context, c client.Client, r events.EventRecorder) (*kueue.Workload, []*kueue.Workload, error) {
@@ -2061,15 +2086,20 @@ func isGated(pod *corev1.Pod) bool {
 }
 
 func prepare(log logr.Logger, pod *corev1.Pod, info podset.PodSetInfo) error {
+	// The webhook gated the pod at creation and a pod can only lose scheduling
+	// gates afterwards, so the admission's gates are not merged back: the topology
+	// ungater may already have removed the topology gate, and re-adding it is
+	// rejected by the API server.
+	usesTAS := slices.ContainsFunc(info.SchedulingGates, func(g corev1.PodSchedulingGate) bool {
+		return g.Name == kueue.TopologySchedulingGate
+	})
+	info.SchedulingGates = nil
 	if err := podset.Merge(log, &pod.ObjectMeta, &pod.Spec, info); err != nil {
 		return err
 	}
 	utilpod.Ungate(pod, podconstants.SchedulingGateName)
 	// Remove the TopologySchedulingGate if the Pod is scheduled without using TAS
-	found := slices.ContainsFunc(info.SchedulingGates, func(g corev1.PodSchedulingGate) bool {
-		return g.Name == kueue.TopologySchedulingGate
-	})
-	if !found {
+	if !usesTAS {
 		utilpod.Ungate(pod, kueue.TopologySchedulingGate)
 	}
 	return nil
