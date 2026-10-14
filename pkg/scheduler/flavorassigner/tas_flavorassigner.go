@@ -57,11 +57,20 @@ func (a *Assignment) WorkloadsTopologyRequests(log logr.Logger, wl *workload.Inf
 
 			var previousAssignment *kueue.TopologyAssignment
 
-			// Only unconstrained topology is supported with elastic workload slices.
+			// Elastic workload slices support unconstrained topology, and required
+			// topology behind ElasticJobsViaWorkloadSlicesWithRequiredTopology.
 			if workload.IsElasticWorkload(wl.Obj) && features.Enabled(features.ElasticJobsViaWorkloadSlicesWithTAS) {
 				if podSet.TopologyRequest != nil && podSet.TopologyRequest.Required != nil {
-					a.psError(psAssignment, ErrElasticRequiredTopologyNotSupported)
-					continue
+					if !features.Enabled(features.ElasticJobsViaWorkloadSlicesWithRequiredTopology) {
+						a.psError(psAssignment, ErrElasticRequiredTopologyNotSupported)
+						continue
+					}
+					// Growth joins the domain the running members hold, so it waits
+					// while any of them sits on a node awaiting replacement.
+					if a.replaceWorkloadSlice != nil && workload.HasUnhealthyNodes(a.replaceWorkloadSlice.Obj) {
+						a.psError(psAssignment, ErrElasticPredecessorHasUnhealthyNodes)
+						continue
+					}
 				}
 				if podSet.TopologyRequest != nil && podSet.TopologyRequest.Preferred != nil {
 					a.psError(psAssignment, ErrElasticPreferredTopologyNotSupported)

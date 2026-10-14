@@ -7862,6 +7862,123 @@ func TestFindTopologyAssignments(t *testing.T) {
 				},
 			},
 		},
+		"elastic workload scale up with required topology: the delta stays in the previous rack": {
+			// The previous pods hold x1 and x2 in rack r1. Rack r2 offers the
+			// tighter fit for one more pod, which best-fit would take; required
+			// topology keeps the slice in r1, so the delta goes to x3.
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlices:                     true,
+				features.ElasticJobsViaWorkloadSlicesWithTAS:              true,
+				features.ElasticJobsViaWorkloadSlicesWithRequiredTopology: true,
+			},
+			nodes: []corev1.Node{
+				*testingnode.MakeNode("x1").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x1").
+					StatusAllocatable(corev1.ResourceList{
+						"example.com/gpu":   resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x2").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x2").
+					StatusAllocatable(corev1.ResourceList{
+						"example.com/gpu":   resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x3").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x3").
+					StatusAllocatable(corev1.ResourceList{
+						"example.com/gpu":   resource.MustParse("2"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("y1").
+					Label(tasRackLabel, "r2").
+					Label(corev1.LabelHostname, "y1").
+					StatusAllocatable(corev1.ResourceList{
+						"example.com/gpu":   resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+			},
+			levels: []string{tasRackLabel, corev1.LabelHostname},
+			podSets: []PodSetTestCase{{
+				topologyRequest: &kueue.PodSetTopologyRequest{
+					Required: new(string(tasRackLabel)),
+				},
+				requests: map[corev1.ResourceName]int64{
+					"example.com/gpu": 1,
+				},
+				count: 3,
+				previousAssignment: tas.V1Beta2From(&tas.TopologyAssignment{
+					Levels: defaultOneLevel,
+					Domains: []tas.TopologyDomainAssignment{
+						{Count: 1, Values: []string{"x1"}},
+						{Count: 1, Values: []string{"x2"}},
+					},
+				}),
+				wantAssignment: &tas.TopologyAssignment{
+					Levels: defaultOneLevel,
+					Domains: []tas.TopologyDomainAssignment{
+						{Count: 1, Values: []string{"x1"}},
+						{Count: 1, Values: []string{"x2"}},
+						{Count: 1, Values: []string{"x3"}},
+					},
+				},
+			}},
+		},
+		"elastic workload scale up with required topology: a stale previous assignment waits instead of re-placing": {
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlices:                     true,
+				features.ElasticJobsViaWorkloadSlicesWithTAS:              true,
+				features.ElasticJobsViaWorkloadSlicesWithRequiredTopology: true,
+			},
+			nodes: []corev1.Node{
+				*testingnode.MakeNode("x1").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x1").
+					StatusAllocatable(corev1.ResourceList{
+						"example.com/gpu":   resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+				*testingnode.MakeNode("x2").
+					Label(tasRackLabel, "r1").
+					Label(corev1.LabelHostname, "x2").
+					StatusAllocatable(corev1.ResourceList{
+						"example.com/gpu":   resource.MustParse("1"),
+						corev1.ResourcePods: resource.MustParse("10"),
+					}).
+					Ready().
+					Obj(),
+			},
+			levels: []string{tasRackLabel, corev1.LabelHostname},
+			podSets: []PodSetTestCase{{
+				topologyRequest: &kueue.PodSetTopologyRequest{
+					Required: new(string(tasRackLabel)),
+				},
+				requests: map[corev1.ResourceName]int64{
+					"example.com/gpu": 1,
+				},
+				count: 2,
+				previousAssignment: tas.V1Beta2From(&tas.TopologyAssignment{
+					Levels: defaultOneLevel,
+					Domains: []tas.TopologyDomainAssignment{
+						{Count: 1, Values: []string{"gone"}},
+					},
+				}),
+				wantReason: `previous topology assignment is stale: domain "gone" is gone; the scale-up waits for its repair`,
+			}},
+		},
 		"elastic workload scale up: delta-only placement preserves previous assignment": {
 			nodes: []corev1.Node{
 				*testingnode.MakeNode("x1").

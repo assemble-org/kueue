@@ -18,6 +18,7 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
@@ -51,6 +52,14 @@ func (s *TASFlavorSnapshot) handleElasticWorkload(
 	}
 
 	if isStale, staleDomain := s.IsTopologyAssignmentStale(prevAssignment); isStale {
+		if isRequired(workers.PodSet.TopologyRequest) {
+			// Required placement keeps the running members' domain. A fresh
+			// placement could move the group elsewhere, so the scale-up waits
+			// for the stale domain to be repaired instead.
+			return elasticPlacementResult{applied: true, assignments: map[kueue.PodSetReference]tasPodSetAssignmentResult{
+				workers.PodSet.Name: {FailureReason: fmt.Sprintf("previous topology assignment is stale: domain %q is gone; the scale-up waits for its repair", staleDomain)},
+			}}
+		}
 		s.log.V(3).Info("previous TAS assignment is stale, doing fresh placement",
 			"staleDomain", staleDomain)
 		return elasticPlacementResult{applied: false}
@@ -114,10 +123,22 @@ func (s *TASFlavorSnapshot) handleScaleUp(
 		placementLeader = nil
 	}
 
+	// Required topology holds the whole slice in one domain, so the new pods
+	// are placed inside the domain the previous assignment occupies, the same
+	// way a failed node's replacement is.
+	var requiredDomain utiltas.TopologyDomainID
+	if isRequired(workers.PodSet.TopologyRequest) && previousCount > 0 {
+		requiredDomain = s.requiredReplacementDomain(&workers, prevAssignment)
+		if requiredDomain == "" {
+			result[workers.PodSet.Name] = tasPodSetAssignmentResult{FailureReason: "cannot resolve the required topology domain of the previous assignment"}
+			return elasticPlacementResult{applied: true, assignments: result}
+		}
+	}
+
 	// Scaling up places new pods, so the group's spreading counts apply, exactly
 	// as they do on the fresh-placement path.
 	podSetGroupCountByDomain := opts.topologySpreadCounts[utiltas.GroupKeyForPodSet(workers.PodSet)]
-	deltaAssignments, deltaLeafAssignments, reason := s.findTopologyAssignment(ctx, deltaRequest, placementLeader, assumedUsage, opts.simulateEmpty, "", opts.workload, podSetGroupCountByDomain)
+	deltaAssignments, deltaLeafAssignments, reason := s.findTopologyAssignment(ctx, deltaRequest, placementLeader, assumedUsage, opts.simulateEmpty, requiredDomain, opts.workload, podSetGroupCountByDomain)
 	if reason != "" {
 		result[workers.PodSet.Name] = tasPodSetAssignmentResult{FailureReason: reason}
 		return elasticPlacementResult{applied: true, assignments: result}

@@ -171,6 +171,15 @@ const (
 	// Enables ProvisioningRequest integration with elastic workload slices.
 	ElasticJobsViaWorkloadSlicesForProvisioningRequests featuregate.Feature = "ElasticJobsViaWorkloadSlicesForProvisioningRequests"
 
+	// owner: @kevinmingtarja
+	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/77-dynamically-sized-jobs
+	//
+	// ElasticJobsViaWorkloadSlicesWithRequiredTopology lets an elastic workload
+	// slice request required topology. A scale-up places only the new pods,
+	// inside the domain the previous slice holds, and waits while that domain
+	// is stale or has unhealthy nodes. Requires ElasticJobsViaWorkloadSlicesWithTAS.
+	ElasticJobsViaWorkloadSlicesWithRequiredTopology featuregate.Feature = "ElasticJobsViaWorkloadSlicesWithRequiredTopology"
+
 	// owner: @sohankunkerkar
 	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/77-dynamically-sized-jobs
 	//
@@ -925,6 +934,7 @@ var defaultFeatureGateDependencies = map[featuregate.Feature][]featuregate.Featu
 	KueueDRAIntegrationDeviceTaints:                     {KueueDRADeviceFeasibility},
 	TASPartialSlices:                                    {TopologyAwareScheduling},
 	ElasticJobsViaWorkloadSlicesForProvisioningRequests: {ElasticJobsViaWorkloadSlices},
+	ElasticJobsViaWorkloadSlicesWithRequiredTopology:    {ElasticJobsViaWorkloadSlicesWithTAS},
 	SchedulerLibraryIntegration:                         {TopologyAwareScheduling},
 	SchedulerLibraryDeepIntegration:                     {SchedulerLibraryIntegration},
 }
@@ -1007,6 +1017,9 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
 	},
 	ElasticJobsViaWorkloadSlicesForProvisioningRequests: {
 		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
+	},
+	ElasticJobsViaWorkloadSlicesWithRequiredTopology: {
+		{Version: version.MustParse("0.21"), Default: false, PreRelease: featuregate.Alpha},
 	},
 	ElasticJobsViaWorkloadSlicesWithTAS: {
 		{Version: version.MustParse("0.17"), Default: false, PreRelease: featuregate.Alpha},
