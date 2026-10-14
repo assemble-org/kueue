@@ -54,12 +54,33 @@ func (r *Manager) EnsureWorkloadSlices(
 	jobObject client.Object,
 	jobObjectGVK schema.GroupVersionKind,
 ) (*kueue.Workload, bool, error) {
-	jobPodSetsCounts := workload.ExtractPodSetCounts(jobPodSets)
-
 	workloads, err := FindNotFinishedWorkloads(ctx, r.Client, jobObject, jobObjectGVK)
 	if err != nil {
 		return nil, true, fmt.Errorf("failed to find active workload slices: %w", err)
 	}
+	return r.ensureWorkloadSlices(ctx, jobPodSets, workloads)
+}
+
+// EnsureWorkloadSlicesForSlice is EnsureWorkloadSlices for a chain keyed by its
+// slice name instead of an owner reference.
+func (r *Manager) EnsureWorkloadSlicesForSlice(
+	ctx context.Context,
+	jobPodSets []kueue.PodSet,
+	namespace, sliceName string,
+) (*kueue.Workload, bool, error) {
+	workloads, err := FindNotFinishedWorkloadsForSlice(ctx, r.Client, namespace, sliceName)
+	if err != nil {
+		return nil, true, fmt.Errorf("failed to find active workload slices: %w", err)
+	}
+	return r.ensureWorkloadSlices(ctx, jobPodSets, workloads)
+}
+
+func (r *Manager) ensureWorkloadSlices(
+	ctx context.Context,
+	jobPodSets []kueue.PodSet,
+	workloads []kueue.Workload,
+) (*kueue.Workload, bool, error) {
+	jobPodSetsCounts := workload.ExtractPodSetCounts(jobPodSets)
 
 	// An evicted slice can still own running Pods. Return it to the job
 	// reconciler until its reservation is released, unless an admitted

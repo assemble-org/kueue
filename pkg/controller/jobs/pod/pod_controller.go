@@ -49,6 +49,7 @@ import (
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/constants"
 	ctrlconstants "sigs.k8s.io/kueue/pkg/controller/constants"
+	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
 	deploymentconstants "sigs.k8s.io/kueue/pkg/controller/jobs/deployment/constants"
 	podconstants "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
@@ -67,6 +68,7 @@ import (
 	utilslices "sigs.k8s.io/kueue/pkg/util/slices"
 	"sigs.k8s.io/kueue/pkg/workload"
 	workloadfinish "sigs.k8s.io/kueue/pkg/workload/finish"
+	"sigs.k8s.io/kueue/pkg/workloadslicing"
 )
 
 const (
@@ -197,6 +199,7 @@ var (
 	_ jobframework.JobWithCustomWorkloadConditions = (*Pod)(nil)
 	_ jobframework.TopLevelJob                     = (*Pod)(nil)
 	_ jobframework.JobWithCustomQueueNameChange    = (*Pod)(nil)
+	_ jobframework.JobWithWorkloadSliceName        = (*Pod)(nil)
 )
 
 // PodOption is a function type that modifies a Pod. It allows customization of a Pod's
@@ -562,6 +565,15 @@ func (p *Pod) PodsReady(ctx context.Context, _ client.Client) bool {
 			readyCount++
 		}
 	}
+	// A member the elastic ungater has not released is not expected to be ready:
+	// the active slice was admitted without it.
+	if p.isElasticGroupMember() {
+		for i := range p.list.Items {
+			if utilpod.HasGate(&p.list.Items[i], kueue.ElasticJobSchedulingGate) {
+				tc--
+			}
+		}
+	}
 	notReady := tc - readyCount
 	if notReady <= allowedNotReady {
 		if notReady > 0 {
@@ -719,6 +731,43 @@ func SetPodGroupName(p *corev1.Pod, groupName string) {
 	}
 }
 
+// isElasticGroupMember reports whether the pod belongs to a pod group that opted
+// into workload slicing. The webhook sees a single pod, so this reads the group
+// name rather than isGroup.
+func (p *Pod) isElasticGroupMember() bool {
+	return features.Enabled(features.ElasticJobsViaWorkloadSlicesForPodGroups) &&
+		utilpod.GetPodGroupName(&p.pod) != "" &&
+		workloadslicing.Enabled(&p.pod)
+}
+
+// WorkloadSliceName keys an elastic group's Workload chain by the group name.
+// Every member Pod owns the group's Workload, so an owner lookup from the
+// reconciled Pod would miss slices created before that Pod existed.
+func (p *Pod) WorkloadSliceName() string {
+	if !p.isElasticGroupMember() {
+		return ""
+	}
+	return utilpod.GetPodGroupName(&p.pod)
+}
+
+// groupMinCount returns the value of GroupMinCountAnnotation for the pod being
+// reconciled, and whether the annotation is present.
+func (p *Pod) groupMinCount() (int, bool, error) {
+	value, found := p.Object().GetAnnotations()[podconstants.GroupMinCountAnnotation]
+	if !found {
+		return 0, false, nil
+	}
+	minCount, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, true, fmt.Errorf("incorrect annotation value '%s=%s': %w", podconstants.GroupMinCountAnnotation, value, err)
+	}
+	if minCount < 1 {
+		return 0, true, fmt.Errorf("incorrect annotation value '%s=%s': group min count should be greater than zero",
+			podconstants.GroupMinCountAnnotation, value)
+	}
+	return minCount, true, nil
+}
+
 // groupTotalCount returns the value of GroupTotalCountAnnotation for the pod being reconciled at the moment.
 // It doesn't check if the whole group has the same total group count annotation value.
 func (p *Pod) groupTotalCount() (int, error) {
@@ -844,6 +893,15 @@ func (p *Pod) Load(ctx context.Context, c client.Client, key *types.NamespacedNa
 				return jobframework.NewLoadResult(false, p.isFound), nil
 			}
 		}
+		if p.isElasticGroupMember() {
+			// The chain is released as a whole; finalization then drops the
+			// finalizers of the deleting slices and of the pods.
+			if err := p.releaseWorkloadSlices(ctx, c); err != nil {
+				return nil, err
+			}
+			ctrl.LoggerFrom(ctx).V(2).Info("All elastic pod group members are terminating; releasing its workload slices and treating the pod group as terminating")
+			return jobframework.NewLoadResult(true, p.isFound), nil
+		}
 		// Any Workload still existing under the group name (even foreign-owned) blocks finalizing the group.
 		wl := &kueue.Workload{}
 		if err := c.Get(ctx, client.ObjectKey{Namespace: p.key.Namespace, Name: p.key.Name}, wl); err == nil {
@@ -864,21 +922,94 @@ func (p *Pod) fastAdmission() bool {
 }
 
 func (p *Pod) constructGroupPodSets(referenceOrder []kueue.PodSetReference) ([]kueue.PodSet, error) {
-	if p.fastAdmission() {
+	var podSets []kueue.PodSet
+	// An elastic group's slice is sized by the group total count, like fast
+	// admission: a failed member keeps its slot for a replacement instead of
+	// reading as a scale-down of the admitted slice.
+	if p.fastAdmission() || p.isElasticGroupMember() {
 		tc, err := p.groupTotalCount()
 		if err != nil {
 			return nil, err
 		}
 
-		podSets, err := constructGroupPodSetsFast(p.list.Items, tc)
+		if p.isElasticGroupMember() {
+			if err := p.validateSingleRole(); err != nil {
+				return nil, err
+			}
+		}
+
+		fastPodSets, err := constructGroupPodSetsFast(p.list.Items, tc)
 		if err != nil {
 			return nil, err
 		}
 
-		return reorderPodSets(podSets, referenceOrder), nil
+		podSets = reorderPodSets(fastPodSets, referenceOrder)
+	} else {
+		var err error
+		podSets, err = constructGroupPodSets(p.list.Items, referenceOrder)
+		if err != nil {
+			return nil, err
+		}
 	}
+	return p.applyGroupMinCount(podSets)
+}
 
-	return constructGroupPodSets(p.list.Items, referenceOrder)
+// validateSingleRole rejects an elastic group whose runnable members have more than
+// one role: the slice is one PodSet sized by the group total count, and the group
+// minimum is one number for the whole group.
+func (p *Pod) validateSingleRole() error {
+	roles := sets.New[string]()
+	for i := range p.list.Items {
+		if !isPodRunnableOrSucceeded(&p.list.Items[i]) {
+			continue
+		}
+		roleHash, err := getRoleHash(p.list.Items[i])
+		if err != nil {
+			return fmt.Errorf("failed to calculate pod role hash: %w", err)
+		}
+		roles.Insert(roleHash)
+	}
+	if roles.Len() > 1 {
+		return jobframework.UnretryableError(fmt.Sprintf("elastic pod group '%s' has %d roles; an elastic group needs a single role",
+			utilpod.GetPodGroupName(&p.pod), roles.Len()))
+	}
+	return nil
+}
+
+// applyGroupMinCount turns an elastic group's minimum into the PodSet floor the
+// scheduler may partially admit down to.
+func (p *Pod) applyGroupMinCount(podSets []kueue.PodSet) ([]kueue.PodSet, error) {
+	if !p.isElasticGroupMember() {
+		return podSets, nil
+	}
+	minCount, found, err := p.groupMinCount()
+	if err != nil {
+		return nil, jobframework.UnretryableError(err.Error())
+	}
+	if !found || len(podSets) != 1 {
+		return podSets, nil
+	}
+	podSets[0].MinCount = ptr.To(min(int32(minCount), podSets[0].Count))
+	return podSets, nil
+}
+
+// releaseWorkloadSlices requests deletion of every slice in the group's chain.
+func (p *Pod) releaseWorkloadSlices(ctx context.Context, c client.Client) error {
+	slices := &kueue.WorkloadList{}
+	if err := c.List(ctx, slices, client.InNamespace(p.key.Namespace),
+		client.MatchingFields{indexer.WorkloadSliceNameKey: p.key.Name}); err != nil {
+		return err
+	}
+	for i := range slices.Items {
+		if !slices.Items[i].DeletionTimestamp.IsZero() {
+			continue
+		}
+		ctrl.LoggerFrom(ctx).V(2).Info("Deleting the workload slice of a terminating elastic pod group", "workload", klog.KObj(&slices.Items[i]))
+		if err := client.IgnoreNotFound(c.Delete(ctx, &slices.Items[i])); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func podSetReferenceOrder(podSets []kueue.PodSet) []kueue.PodSetReference {
@@ -1172,6 +1303,16 @@ func (p *Pod) validatePodGroupMetadata(r events.EventRecorder, activePods []core
 				p.pod.GetName(), podInGroup.GetName(),
 				podconstants.GroupTotalCountAnnotation,
 				groupTotalCount, tc))
+		}
+
+		if p.isElasticGroupMember() {
+			groupMinCount := p.pod.GetAnnotations()[podconstants.GroupMinCountAnnotation]
+			if podMinCount := podInGroup.GetAnnotations()[podconstants.GroupMinCountAnnotation]; podMinCount != groupMinCount {
+				return jobframework.UnretryableError(fmt.Sprintf("pods '%s' and '%s' has different '%s' values: %q!=%q",
+					p.pod.GetName(), podInGroup.GetName(),
+					podconstants.GroupMinCountAnnotation,
+					groupMinCount, podMinCount))
+			}
 		}
 	}
 
@@ -1480,7 +1621,19 @@ func (p *Pod) ConstructComposableWorkload(ctx context.Context, c client.Client, 
 		return nil, jobframework.UnretryableError(errMsgIncorrectGroupRoleCount)
 	}
 
-	wl := NewGroupWorkload(p.workloadName(), p.Object(), podSets, nil, nil)
+	name := p.workloadName()
+	if p.isElasticGroupMember() {
+		// A partially admitted slice is followed by a probe for the rest of the
+		// group, which needs its own name beside the slice it replaces.
+		extra, err := jobframework.ScaleUpProbeExtra(ctx, c, p, podSets)
+		if err != nil {
+			return nil, err
+		}
+		if extra != "" {
+			name = fmt.Sprintf("%s-%s", name, extra)
+		}
+	}
+	wl := NewGroupWorkload(name, p.Object(), podSets, nil, nil)
 
 	for _, pod := range p.list.Items {
 		if err := controllerutil.SetOwnerReference(&pod, wl, c.Scheme()); err != nil {
@@ -1560,6 +1713,15 @@ func (p *Pod) ListChildWorkloads(ctx context.Context, c client.Client, key types
 
 	// Get related workloads for the pod group
 	if p.isGroup {
+		if p.isElasticGroupMember() {
+			// Every slice of the chain carries the group name as its slice name.
+			if err := c.List(ctx, workloads, client.InNamespace(key.Namespace),
+				client.MatchingFields{indexer.WorkloadSliceNameKey: key.Name}); err != nil {
+				log.Error(err, "Unable to list the workload slices of the pod group")
+				return nil, err
+			}
+			return workloads, nil
+		}
 		workload := &kueue.Workload{}
 		if err := c.Get(ctx, types.NamespacedName{Name: key.Name, Namespace: key.Namespace}, workload); err != nil {
 			if apierrors.IsNotFound(err) {

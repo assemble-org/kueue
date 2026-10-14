@@ -1097,7 +1097,7 @@ func (r *JobReconciler) syncWorkloadSlicePriority(ctx context.Context, job Gener
 
 	// Quota-reserved rather than admitted: FindLatestActiveWorkload selects on
 	// the reservation, and the distinction is what makes the skip below matter.
-	retained, err := workloadslicing.FindLatestActiveWorkload(ctx, r.client, object, job.GVK())
+	retained, err := findLatestActiveWorkloadSlice(ctx, r.client, job)
 	if err != nil {
 		return err
 	}
@@ -1203,11 +1203,29 @@ func (r *JobReconciler) ensureOneWorkload(ctx context.Context, job GenericJob, o
 		// Workload slices allow modifications only to PodSet.Count.
 		// Any other changes will result in the slice being marked as incompatible,
 		// and the workload will fall back to being processed by the original ensureOneWorkload function.
-		wl, compatible, err := r.workloadSlices.EnsureWorkloadSlices(ctx, podSets, object, job.GVK())
+		wl, compatible, err := r.ensureWorkloadSlices(ctx, job, object, podSets)
 		if err != nil {
 			return nil, err
 		}
 		if compatible {
+			if cj, implements := job.(ComposableJob); implements && wl != nil {
+				// A group starts from the slice that holds the admission. While a
+				// partially admitted slice waits for its probe, the probe is the
+				// chain's selected slice, but a suspended group (a member still
+				// carries the admission gate) has to be started from the admitted one.
+				if job.IsSuspended() && !workload.IsAdmitted(wl) {
+					admitted, err := workloadslicing.FindLatestAdmittedWorkloadForSlice(ctx, r.client, wl.Namespace, workloadslicing.SliceName(wl))
+					if err != nil {
+						return nil, err
+					}
+					if admitted != nil {
+						wl = admitted
+					}
+				}
+				if err := cj.EnsureWorkloadOwnedByAllMembers(ctx, r.client, r.record, wl); err != nil {
+					return nil, err
+				}
+			}
 			if err := r.syncWorkloadSlicePriority(ctx, job, object, wl); err != nil {
 				return nil, err
 			}
@@ -1991,9 +2009,18 @@ func ConstructWorkload(ctx context.Context, c client.Client, job GenericJob, lab
 	return wl, nil
 }
 
+// ScaleUpProbeExtra returns the name suffix of the partial scale-up probe for the
+// job's current podSets and copies the active slice's minCount floors into them.
+// It returns "" when the job does not use partial scale-up or no slice is active.
+func ScaleUpProbeExtra(ctx context.Context, c client.Client, job GenericJob, podSets []kueue.PodSet) (string, error) {
+	if !ElasticPartialScaleUpEnabled(job) {
+		return "", nil
+	}
+	return prepareWorkloadSliceForScaleUp(ctx, c, job, podSets)
+}
+
 func prepareWorkloadSliceForScaleUp(ctx context.Context, c client.Client, job GenericJob, podSets []kueue.PodSet) (string, error) {
-	object := job.Object()
-	prevWl, err := workloadslicing.FindLatestActiveWorkload(ctx, c, object, job.GVK())
+	prevWl, err := findLatestActiveWorkloadSlice(ctx, c, job)
 	if err != nil {
 		return "", err
 	}
@@ -2046,7 +2073,7 @@ func prepareWorkloadSlice(ctx context.Context, clnt client.Client, job GenericJo
 	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue)
 
 	// Lookup existing slice for a given job.
-	workloadSlices, err := workloadslicing.FindNotFinishedWorkloads(ctx, clnt, job.Object(), job.GVK())
+	workloadSlices, err := findNotFinishedWorkloadSlices(ctx, clnt, job)
 	if err != nil {
 		return fmt.Errorf("failure looking up workload slices: %w", err)
 	}
@@ -2416,6 +2443,43 @@ func clearUnusableMinCounts(in []kueue.PodSet, wl *kueue.Workload) []kueue.PodSe
 		in[i].MinCount = nil
 	}
 	return in
+}
+
+// JobWithWorkloadSliceName is implemented by jobs whose Workload slice chain is
+// keyed by a name of its own rather than by the owner reference of the reconciled
+// object. A pod group's Workload is owned by every member Pod, so the reconciled
+// Pod's name does not identify the chain; the group name does.
+type JobWithWorkloadSliceName interface {
+	// WorkloadSliceName returns the chain name, or "" to key the chain by owner.
+	WorkloadSliceName() string
+}
+
+func workloadSliceNameOf(job GenericJob) string {
+	if j, implements := job.(JobWithWorkloadSliceName); implements {
+		return j.WorkloadSliceName()
+	}
+	return ""
+}
+
+func (r *JobReconciler) ensureWorkloadSlices(ctx context.Context, job GenericJob, object client.Object, podSets []kueue.PodSet) (*kueue.Workload, bool, error) {
+	if sliceName := workloadSliceNameOf(job); sliceName != "" {
+		return r.workloadSlices.EnsureWorkloadSlicesForSlice(ctx, podSets, object.GetNamespace(), sliceName)
+	}
+	return r.workloadSlices.EnsureWorkloadSlices(ctx, podSets, object, job.GVK())
+}
+
+func findNotFinishedWorkloadSlices(ctx context.Context, c client.Client, job GenericJob) ([]kueue.Workload, error) {
+	if sliceName := workloadSliceNameOf(job); sliceName != "" {
+		return workloadslicing.FindNotFinishedWorkloadsForSlice(ctx, c, job.Object().GetNamespace(), sliceName)
+	}
+	return workloadslicing.FindNotFinishedWorkloads(ctx, c, job.Object(), job.GVK())
+}
+
+func findLatestActiveWorkloadSlice(ctx context.Context, c client.Client, job GenericJob) (*kueue.Workload, error) {
+	if sliceName := workloadSliceNameOf(job); sliceName != "" {
+		return workloadslicing.FindLatestActiveWorkloadForSlice(ctx, c, job.Object().GetNamespace(), sliceName)
+	}
+	return workloadslicing.FindLatestActiveWorkload(ctx, c, job.Object(), job.GVK())
 }
 
 // WorkloadSliceEnabled returns true if all the following conditions are met:
