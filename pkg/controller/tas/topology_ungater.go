@@ -371,6 +371,11 @@ func (r *topologyUngater) podsForPodSet(ctx context.Context, ns, workloadSliceNa
 			// so we don't want to count them as already ungated Pods.
 			continue
 		}
+		if utilpod.HasGate(pod, kueue.ElasticJobSchedulingGate) {
+			// The elastic-job ungater has not released this member: the
+			// admission does not cover it, so it takes no topology domain.
+			continue
+		}
 		if !utilpod.HasGate(pod, kueue.TopologySchedulingGate) {
 			domainID := utiltas.DomainID(utiltas.LevelValues(psa.TopologyAssignment.Levels, pod.Spec.NodeSelector))
 			if !assignedDomains.Has(domainID) {
