@@ -127,6 +127,7 @@ func TestDefaultElasticGroupMember(t *testing.T) {
 func TestValidateCreateElasticGroup(t *testing.T) {
 	elasticPath := "metadata.annotations[kueue.x-k8s.io/elastic-job]"
 	minCountPath := "metadata.annotations[kueue.x-k8s.io/pod-group-min-count]"
+	roleCountPath := "metadata.annotations[kueue.x-k8s.io/pod-group-role-count]"
 	testCases := map[string]struct {
 		featureGates map[featuregate.Feature]bool
 		pod          *corev1.Pod
@@ -157,6 +158,26 @@ func TestValidateCreateElasticGroup(t *testing.T) {
 		},
 		"zero minimum is invalid": {
 			pod:     elasticGroupMember("grp-0").Annotation(podconstants.GroupMinCountAnnotation, "0").Obj(),
+			wantErr: field.ErrorList{&field.Error{Type: field.ErrorTypeInvalid, Field: minCountPath}}.ToAggregate(),
+		},
+		"role count within the total count is accepted": {
+			pod: elasticGroupMember("grp-0").Annotation(podconstants.GroupRoleCountAnnotation, "2").Obj(),
+		},
+		"role count without the elastic annotation is forbidden": {
+			pod: testingpod.MakePod("grp-0", elasticTestNamespace).
+				Queue("test-queue").
+				GroupNameLabel(elasticTestGroup).
+				GroupTotalCount("4").
+				Annotation(podconstants.GroupRoleCountAnnotation, "2").
+				Obj(),
+			wantErr: field.ErrorList{&field.Error{Type: field.ErrorTypeForbidden, Field: roleCountPath}}.ToAggregate(),
+		},
+		"role count above the total count is invalid": {
+			pod:     elasticGroupMember("grp-0").Annotation(podconstants.GroupRoleCountAnnotation, "5").Obj(),
+			wantErr: field.ErrorList{&field.Error{Type: field.ErrorTypeInvalid, Field: roleCountPath}}.ToAggregate(),
+		},
+		"minimum above the role count is invalid": {
+			pod:     elasticGroupMember("grp-0").Annotation(podconstants.GroupRoleCountAnnotation, "1").Obj(),
 			wantErr: field.ErrorList{&field.Error{Type: field.ErrorTypeInvalid, Field: minCountPath}}.ToAggregate(),
 		},
 		"elastic pod is rejected while the pod groups gate is off": {
@@ -263,7 +284,7 @@ func TestConstructGroupPodSetsElasticGroup(t *testing.T) {
 			members:   members(4, "", "role-a"),
 			wantCount: 4,
 		},
-		"two roles are rejected": {
+		"two roles without role counts are rejected": {
 			members: members(4, "2", "role-a", "role-b"),
 			wantErr: true,
 		},
@@ -342,6 +363,97 @@ func TestConstructGroupPodSetsElasticTemplate(t *testing.T) {
 			}
 			if diff := cmp.Diff(tc.wantNodeSelector, podSets[0].Template.Spec.NodeSelector); diff != "" {
 				t.Errorf("template nodeSelector mismatch (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestConstructGroupPodSetsElasticRoles(t *testing.T) {
+	features.SetFeatureGatesDuringTest(t, elasticGroupGates)
+	// member is a pod of an elastic group of 4 with the given role, role count and
+	// minimum; a released member carries the node selector the ungaters injected.
+	member := func(name, role, roleCount, minCount string, gated bool) *corev1.Pod {
+		w := testingpod.MakePod(name, elasticTestNamespace).
+			Queue("test-queue").
+			GroupNameLabel(elasticTestGroup).
+			GroupTotalCount("4").
+			Annotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
+			RoleHash(role)
+		if roleCount != "" {
+			w.Annotation(podconstants.GroupRoleCountAnnotation, roleCount)
+		}
+		if minCount != "" {
+			w.Annotation(podconstants.GroupMinCountAnnotation, minCount)
+		}
+		if gated {
+			w.Gate(kueue.ElasticJobSchedulingGate)
+		} else {
+			w.NodeSelector("kubernetes.io/hostname", "node-"+name).StatusPhase(corev1.PodRunning)
+		}
+		return w.Obj()
+	}
+	type podSetShape struct {
+		Name     string
+		Count    int32
+		MinCount *int32
+	}
+	testCases := map[string]struct {
+		members []*corev1.Pod
+		want    []podSetShape
+		wantErr bool
+	}{
+		"one PodSet per role, sized by the role count, with the role's own minimum": {
+			members: []*corev1.Pod{
+				member("grp-0", "role-a", "2", "1", false),
+				member("grp-1", "role-a", "2", "1", true),
+				member("grp-2", "role-b", "2", "2", true),
+				member("grp-3", "role-b", "2", "2", true),
+			},
+			want: []podSetShape{{"role-a", 2, ptr.To[int32](1)}, {"role-b", 2, ptr.To[int32](2)}},
+		},
+		"a second role without a role count is rejected": {
+			members: []*corev1.Pod{
+				member("grp-0", "role-a", "", "2", true),
+				member("grp-1", "role-b", "", "2", true),
+			},
+			wantErr: true,
+		},
+		"role counts that do not add up to the total count are rejected": {
+			members: []*corev1.Pod{
+				member("grp-0", "role-a", "2", "", true),
+				member("grp-1", "role-b", "3", "", true),
+			},
+			wantErr: true,
+		},
+		"a single role is still sized by the group total count": {
+			members: []*corev1.Pod{
+				member("grp-0", "role-a", "2", "2", true),
+				member("grp-1", "role-a", "2", "2", true),
+			},
+			want: []podSetShape{{"role-a", 4, ptr.To[int32](2)}},
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			podSets, err := elasticGroup(tc.members...).constructGroupPodSets(nil)
+			if tc.wantErr {
+				if !jobframework.IsUnretryableError(err) {
+					t.Fatalf("constructGroupPodSets() error = %v, want an unretryable error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("constructGroupPodSets() error = %v", err)
+			}
+			got := make([]podSetShape, 0, len(podSets))
+			for _, ps := range podSets {
+				got = append(got, podSetShape{string(ps.Name), ps.Count, ps.MinCount})
+				if ps.Template.Spec.NodeSelector != nil {
+					t.Errorf("PodSet %s copied a released member's nodeSelector %v into its template", ps.Name, ps.Template.Spec.NodeSelector)
+				}
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("PodSets mismatch (-want,+got):\n%s", diff)
 			}
 		})
 	}

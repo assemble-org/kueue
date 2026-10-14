@@ -28,6 +28,7 @@ const (
 	GroupNameAnnotation               = "kueue.x-k8s.io/pod-group-name"
 	GroupTotalCountAnnotation         = "kueue.x-k8s.io/pod-group-total-count"
 	GroupMinCountAnnotation           = "kueue.x-k8s.io/pod-group-min-count"
+	GroupRoleCountAnnotation          = "kueue.x-k8s.io/pod-group-role-count"
 	GroupMaxNotReadyCountAnnotation   = "kueue.x-k8s.io/pod-group-max-not-ready-count"
 	GroupFastAdmissionAnnotationKey   = "kueue.x-k8s.io/pod-group-fast-admission"
 	GroupFastAdmissionAnnotationValue = "true"
