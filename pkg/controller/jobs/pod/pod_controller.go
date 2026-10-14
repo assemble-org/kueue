@@ -936,13 +936,15 @@ func (p *Pod) constructGroupPodSets(referenceOrder []kueue.PodSetReference) ([]k
 			return nil, err
 		}
 
+		templatePods := p.list.Items
 		if p.isElasticGroupMember() {
 			if err := p.validateSingleRole(); err != nil {
 				return nil, err
 			}
+			templatePods = gatedMembersFirst(p.list.Items)
 		}
 
-		fastPodSets, err := constructGroupPodSetsFast(p.list.Items, tc)
+		fastPodSets, err := constructGroupPodSetsFast(templatePods, tc)
 		if err != nil {
 			return nil, err
 		}
@@ -978,6 +980,25 @@ func (p *Pod) validateSingleRole() error {
 			utilpod.GetPodGroupName(&p.pod), roles.Len()))
 	}
 	return nil
+}
+
+// gatedMembersFirst orders the members still holding the elastic-job gate ahead
+// of the released ones. A released member carries the node selector the ungaters
+// injected (the flavor's node labels and its topology domain), so a slice template
+// copied from it would pin every new member to that node.
+func gatedMembersFirst(pods []corev1.Pod) []corev1.Pod {
+	ordered := make([]corev1.Pod, 0, len(pods))
+	for i := range pods {
+		if utilpod.HasGate(&pods[i], kueue.ElasticJobSchedulingGate) {
+			ordered = append(ordered, pods[i])
+		}
+	}
+	for i := range pods {
+		if !utilpod.HasGate(&pods[i], kueue.ElasticJobSchedulingGate) {
+			ordered = append(ordered, pods[i])
+		}
+	}
+	return ordered
 }
 
 // applyGroupMinCount turns an elastic group's minimum into the PodSet floor the

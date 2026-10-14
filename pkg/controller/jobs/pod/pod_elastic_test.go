@@ -307,6 +307,46 @@ func TestConstructGroupPodSetsElasticGroup(t *testing.T) {
 	}
 }
 
+func TestConstructGroupPodSetsElasticTemplate(t *testing.T) {
+	features.SetFeatureGatesDuringTest(t, elasticGroupGates)
+	// A released member carries the node selectors the ungaters injected.
+	released := func(name, node string) *corev1.Pod {
+		return elasticGroupMember(name).RoleHash("role-a").
+			NodeSelector("kubernetes.io/hostname", node).
+			NodeSelector("example.com/pool", "gpu").
+			StatusPhase(corev1.PodRunning).Obj()
+	}
+	gated := func(name string) *corev1.Pod {
+		return elasticGroupMember(name).RoleHash("role-a").Gate(kueue.ElasticJobSchedulingGate).Obj()
+	}
+	testCases := map[string]struct {
+		members          []*corev1.Pod
+		wantNodeSelector map[string]string
+	}{
+		"the template comes from a member still holding the elastic gate": {
+			members: []*corev1.Pod{released("grp-0", "node-a"), released("grp-1", "node-b"), gated("grp-2"), gated("grp-3")},
+		},
+		"with every member released the first one is the template": {
+			members:          []*corev1.Pod{released("grp-0", "node-a"), released("grp-1", "node-b")},
+			wantNodeSelector: map[string]string{"kubernetes.io/hostname": "node-a", "example.com/pool": "gpu"},
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			podSets, err := elasticGroup(tc.members...).constructGroupPodSets(nil)
+			if err != nil {
+				t.Fatalf("constructGroupPodSets() error = %v", err)
+			}
+			if len(podSets) != 1 {
+				t.Fatalf("got %d PodSets, want 1", len(podSets))
+			}
+			if diff := cmp.Diff(tc.wantNodeSelector, podSets[0].Template.Spec.NodeSelector); diff != "" {
+				t.Errorf("template nodeSelector mismatch (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestPodsReadyElasticGroup(t *testing.T) {
 	ready := corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue}
 	readyMembers := func() []*corev1.Pod {
