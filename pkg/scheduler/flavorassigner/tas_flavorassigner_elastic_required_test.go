@@ -117,6 +117,13 @@ func TestWorkloadsTopologyRequests_ElasticRequiredTopology(t *testing.T) {
 				if len(tasReqs) != 0 {
 					t.Errorf("expected no TAS requests, got %+v", tasReqs)
 				}
+				if reason := assignment.PodSets[0].Status.noFitReason; reason != kueue.WorkloadQuotaReservedReasonAssignmentError {
+					t.Errorf("noFitReason = %q, want %q so the pending condition carries a reason", reason, kueue.WorkloadQuotaReservedReasonAssignmentError)
+				}
+				assignment.ResolveNoFitReason(&cq)
+				if assignment.NoFitReason != kueue.WorkloadQuotaReservedReasonAssignmentError {
+					t.Errorf("Assignment.NoFitReason = %q, want %q", assignment.NoFitReason, kueue.WorkloadQuotaReservedReasonAssignmentError)
+				}
 				return
 			}
 			if got != nil {
