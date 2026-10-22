@@ -2314,6 +2314,82 @@ func TestFindLatestAdmittedWorkloadForSliceIncludesFinished(t *testing.T) {
 	}
 }
 
+func TestFindLatestAdmittedWorkloadForSliceSameSecondReplacement(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	admission := utiltestingapi.MakeAdmission("cq").Obj()
+	// The probe is created in the reconcile that observes the predecessor's
+	// admission, inside the same second, and its UID sorts below the
+	// predecessor's.
+	predecessor := utiltestingapi.MakeWorkload("chain", "ns").
+		UID("ffffffff-0000-0000-0000-000000000001").
+		Annotation(EnabledAnnotationKey, EnabledAnnotationValue).
+		Creation(now).
+		ReserveQuotaAt(admission, now).
+		AdmittedAt(true, now).
+		Obj()
+	probe := utiltestingapi.MakeWorkload("chain-scale-up-probe-16", "ns").
+		UID("00000000-0000-0000-0000-000000000002").
+		Annotation(EnabledAnnotationKey, EnabledAnnotationValue).
+		Annotation(kueue.WorkloadSliceNameAnnotation, "chain").
+		Annotation(WorkloadSliceReplacementFor, string(workload.Key(predecessor))).
+		Creation(now).
+		ReserveQuotaAt(admission, now.Add(time.Minute)).
+		AdmittedAt(true, now.Add(time.Minute)).
+		Obj()
+	cl := utiltesting.NewClientBuilder().
+		WithObjects(predecessor, probe).
+		WithIndex(&kueue.Workload{}, indexer.WorkloadSliceNameKey, indexer.IndexWorkloadSliceName).
+		Build()
+
+	got, err := FindLatestAdmittedWorkloadForSlice(t.Context(), cl, "ns", "chain")
+	if err != nil {
+		t.Fatalf("FindLatestAdmittedWorkloadForSlice() error: %v", err)
+	}
+	if got == nil || got.Name != probe.Name {
+		t.Fatalf("FindLatestAdmittedWorkloadForSlice() = %v, want %q", got, probe.Name)
+	}
+
+	active, err := FindLatestActiveWorkloadForSlice(t.Context(), cl, "ns", "chain")
+	if err != nil {
+		t.Fatalf("FindLatestActiveWorkloadForSlice() error: %v", err)
+	}
+	if active == nil || active.Name != probe.Name {
+		t.Fatalf("FindLatestActiveWorkloadForSlice() = %v, want %q", active, probe.Name)
+	}
+}
+
+func TestSortAndFilterNotFinishedWorkloadsFollowsReplacementChain(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	// Three slices of one chain created inside the same second with UIDs in
+	// the reverse of their chain order.
+	first := utiltestingapi.MakeWorkload("chain", "ns").
+		UID("cccccccc-0000-0000-0000-000000000000").
+		Creation(now).
+		Obj()
+	second := utiltestingapi.MakeWorkload("chain-scale-up-probe-2", "ns").
+		UID("bbbbbbbb-0000-0000-0000-000000000000").
+		Annotation(kueue.WorkloadSliceNameAnnotation, "chain").
+		Annotation(WorkloadSliceReplacementFor, string(workload.Key(first))).
+		Creation(now).
+		Obj()
+	third := utiltestingapi.MakeWorkload("chain-scale-up-probe-3", "ns").
+		UID("aaaaaaaa-0000-0000-0000-000000000000").
+		Annotation(kueue.WorkloadSliceNameAnnotation, "chain").
+		Annotation(WorkloadSliceReplacementFor, string(workload.Key(second))).
+		Creation(now).
+		Obj()
+
+	got := sortAndFilterNotFinishedWorkloads([]kueue.Workload{*third, *first, *second})
+	want := []string{first.Name, second.Name, third.Name}
+	var names []string
+	for i := range got {
+		names = append(names, got[i].Name)
+	}
+	if diff := cmp.Diff(want, names); diff != "" {
+		t.Fatalf("sortAndFilterNotFinishedWorkloads() order mismatch (-want +got):\n%s", diff)
+	}
+}
+
 func TestFindLatestActiveWorkload(t *testing.T) {
 	now := time.Now()
 	admission := utiltestingapi.MakeAdmission("cq").Obj()
