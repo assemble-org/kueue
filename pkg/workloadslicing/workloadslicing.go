@@ -173,19 +173,67 @@ func FindLatestAdmittedWorkloadForSlice(ctx context.Context, c client.Client, na
 		client.MatchingFields{indexer.WorkloadSliceNameKey: sliceName}); err != nil {
 		return nil, err
 	}
-	var latestAdmittedWl *kueue.Workload
-	for i := range wls.Items {
-		wl := &wls.Items[i]
-		if !workload.IsAdmitted(wl) || (!opts.includeFinished && workloadfinish.IsFinished(wl)) || workloadevict.IsEvicted(wl) ||
-			(opts.excludeVariants && features.Enabled(features.ConcurrentAdmission) && concurrentadmission.IsVariant(wl)) {
-			continue
-		}
-		if latestAdmittedWl == nil || wl.CreationTimestamp.After(latestAdmittedWl.CreationTimestamp.Time) ||
-			(wl.CreationTimestamp.Equal(&latestAdmittedWl.CreationTimestamp) && cmp.Compare(wl.UID, latestAdmittedWl.UID) > 0) {
-			latestAdmittedWl = wl
+	candidates := slices.DeleteFunc(wls.Items, func(wl kueue.Workload) bool {
+		return !workload.IsAdmitted(&wl) || (!opts.includeFinished && workloadfinish.IsFinished(&wl)) || workloadevict.IsEvicted(&wl) ||
+			(opts.excludeVariants && features.Enabled(features.ConcurrentAdmission) && concurrentadmission.IsVariant(&wl))
+	})
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	depths := replacementDepths(candidates)
+	latest := &candidates[0]
+	for i := 1; i < len(candidates); i++ {
+		if compareSlices(&candidates[i], latest, depths) > 0 {
+			latest = &candidates[i]
 		}
 	}
-	return latestAdmittedWl, nil
+	return latest, nil
+}
+
+// replacementDepths returns, by UID, how many predecessors each workload has
+// inside wls through its WorkloadSliceReplacementFor annotation. A slice that
+// replaces another is the newer of the two whatever their creation timestamps
+// say: a pod group creates its scale-up probe in the reconcile that observes
+// the admission, inside the same second as the slice it replaces, and the
+// timestamp's second resolution cannot order them.
+func replacementDepths(wls []kueue.Workload) map[types.UID]int {
+	byKey := make(map[workload.Reference]int, len(wls))
+	for i := range wls {
+		byKey[workload.Key(&wls[i])] = i
+	}
+	depths := make(map[types.UID]int, len(wls))
+	var depth func(i int, visiting sets.Set[types.UID]) int
+	depth = func(i int, visiting sets.Set[types.UID]) int {
+		wl := &wls[i]
+		if d, ok := depths[wl.UID]; ok {
+			return d
+		}
+		d := 0
+		if ref := ReplacementForKey(wl); ref != nil {
+			if j, found := byKey[*ref]; found && j != i && !visiting.Has(wls[j].UID) {
+				visiting.Insert(wl.UID)
+				d = depth(j, visiting) + 1
+			}
+		}
+		depths[wl.UID] = d
+		return d
+	}
+	for i := range wls {
+		depth(i, sets.New[types.UID]())
+	}
+	return depths
+}
+
+// compareSlices orders two slices of one chain oldest first: by replacement
+// depth, then creation timestamp, then UID.
+func compareSlices(a, b *kueue.Workload, depths map[types.UID]int) int {
+	if c := cmp.Compare(depths[a.UID], depths[b.UID]); c != 0 {
+		return c
+	}
+	if c := a.CreationTimestamp.Compare(b.CreationTimestamp.Time); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.UID, b.UID)
 }
 
 // PreviousAdmittedPodSetCounts returns the effective PodSet counts of the
@@ -207,20 +255,17 @@ func PreviousAdmittedPodSetCounts(ctx context.Context, c client.Client, wl *kueu
 }
 
 func sortAndFilterNotFinishedWorkloads(workloads []kueue.Workload) []kueue.Workload {
-	workloads = slices.Clone(workloads)
-
-	// Sort oldest-first; break same-second ties by UID for stable ordering.
-	slices.SortFunc(workloads, func(a, b kueue.Workload) int {
-		if c := a.CreationTimestamp.Compare(b.CreationTimestamp.Time); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.UID, b.UID)
-	})
-
 	// Filter out workloads with activated "Finished" condition.
-	return slices.DeleteFunc(workloads, func(w kueue.Workload) bool {
+	workloads = slices.DeleteFunc(slices.Clone(workloads), func(w kueue.Workload) bool {
 		return workloadfinish.IsFinished(&w)
 	})
+
+	// Sort oldest-first along the chain.
+	depths := replacementDepths(workloads)
+	slices.SortFunc(workloads, func(a, b kueue.Workload) int {
+		return compareSlices(&a, &b, depths)
+	})
+	return workloads
 }
 
 // FindNotFinishedWorkloads returns a sorted list of workloads "owned by" the provided job object/gvk combination and
