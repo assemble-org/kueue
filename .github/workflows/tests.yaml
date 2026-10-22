@@ -1,0 +1,133 @@
+name: Tests
+
+# The presubmits upstream runs for kubernetes-sigs/kueue on Prow
+# (kubernetes/test-infra, config/jobs/kubernetes-sigs/kueue/kueue-presubmits-main.yaml)
+# do not run for this fork, so this workflow runs the same make targets on
+# GitHub-hosted runners: verify, the unit shards, the single-cluster
+# integration shards and the MultiKueue integration suite.
+
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - 'keps/**'
+      - 'site/**'
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - 'keps/**'
+      - 'site/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # verify-git-tag checks `git describe` against the release tag format.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: make verify
+        run: make verify
+
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    env:
+      UNIT_TOTAL_SHARDS: 2
+      UNIT_SHARD_INDEX: ${{ matrix.shard }}
+      GO_TEST_FLAGS: -race
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: make test (shard ${{ matrix.shard }})
+        run: make test
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-shard-${{ matrix.shard }}
+          path: artifacts/
+          if-no-files-found: ignore
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    env:
+      INTEGRATION_TOTAL_SHARDS: 6
+      INTEGRATION_SHARD_INDEX: ${{ matrix.shard }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: make test-integration (shard ${{ matrix.shard }})
+        run: make test-integration
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-shard-${{ matrix.shard }}
+          path: artifacts/
+          if-no-files-found: ignore
+
+  multikueue-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: make test-multikueue-integration
+        run: make test-multikueue-integration
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multikueue-integration
+          path: artifacts/
+          if-no-files-found: ignore
