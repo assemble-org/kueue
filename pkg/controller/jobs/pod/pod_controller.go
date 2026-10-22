@@ -1092,7 +1092,7 @@ func (p *Pod) applyGroupMinCount(podSets []kueue.PodSet) ([]kueue.PodSet, error)
 		if !found {
 			continue
 		}
-		podSets[i].MinCount = ptr.To(min(int32(minCount), podSets[i].Count))
+		podSets[i].MinCount = new(min(int32(minCount), podSets[i].Count))
 	}
 	return podSets, nil
 }
