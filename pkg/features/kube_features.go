@@ -174,6 +174,12 @@ const (
 	// owner: @kevinmingtarja
 	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/77-dynamically-sized-jobs
 	//
+	// ElasticJobsViaWorkloadSlicesForPodGroups lets a plain-Pod group opt into
+	// workload slicing. The group's Workload chain is keyed by the group name,
+	// the group minimum becomes the PodSet minCount, and the elastic-job
+	// scheduling gate keeps members beyond the granted count gated.
+	// Requires ElasticJobsViaWorkloadSlices.
+	ElasticJobsViaWorkloadSlicesForPodGroups featuregate.Feature = "ElasticJobsViaWorkloadSlicesForPodGroups"
 	// ElasticJobsViaWorkloadSlicesWithRequiredTopology lets an elastic workload
 	// slice request required topology. A scale-up places only the new pods,
 	// inside the domain the previous slice holds, and waits while that domain
@@ -934,6 +940,7 @@ var defaultFeatureGateDependencies = map[featuregate.Feature][]featuregate.Featu
 	KueueDRAIntegrationDeviceTaints:                     {KueueDRADeviceFeasibility},
 	TASPartialSlices:                                    {TopologyAwareScheduling},
 	ElasticJobsViaWorkloadSlicesForProvisioningRequests: {ElasticJobsViaWorkloadSlices},
+	ElasticJobsViaWorkloadSlicesForPodGroups:            {ElasticJobsViaWorkloadSlices},
 	ElasticJobsViaWorkloadSlicesWithRequiredTopology:    {ElasticJobsViaWorkloadSlicesWithTAS},
 	SchedulerLibraryIntegration:                         {TopologyAwareScheduling},
 	SchedulerLibraryDeepIntegration:                     {SchedulerLibraryIntegration},
@@ -1017,6 +1024,9 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
 	},
 	ElasticJobsViaWorkloadSlicesForProvisioningRequests: {
 		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
+	},
+	ElasticJobsViaWorkloadSlicesForPodGroups: {
+		{Version: version.MustParse("0.21"), Default: false, PreRelease: featuregate.Alpha},
 	},
 	ElasticJobsViaWorkloadSlicesWithRequiredTopology: {
 		{Version: version.MustParse("0.21"), Default: false, PreRelease: featuregate.Alpha},

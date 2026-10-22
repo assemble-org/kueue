@@ -19,6 +19,7 @@ package pod
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/validation"
@@ -39,6 +40,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/features"
 	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
 	"sigs.k8s.io/kueue/pkg/util/webhook"
+	"sigs.k8s.io/kueue/pkg/workloadslicing"
 )
 
 var (
@@ -194,6 +196,9 @@ func (w *PodWebhook) Default(ctx context.Context, obj *corev1.Pod) error {
 		if err := pod.addRoleHash(); err != nil {
 			return err
 		}
+		if pod.isElasticGroupMember() {
+			pod.prepareElasticGroupMember()
+		}
 		// copy back changes to the object
 		pod.pod.DeepCopyInto(obj)
 	}
@@ -238,6 +243,7 @@ func (w *PodWebhook) ValidateUpdate(ctx context.Context, oldObj, newObj *corev1.
 		newGroupName := utilpod.GetPodGroupName(&newPod.pod)
 		allErrs = append(allErrs, validation.ValidateImmutableField(newGroupName, oldGroupName, getGroupNamePath(&newPod.pod))...)
 	}
+	allErrs = append(allErrs, validateUpdateForElasticGroupAnnotations(oldPod, newPod)...)
 
 	if _, suspendByParent := newPod.pod.Annotations[podconstants.SuspendedByParentAnnotation]; !suspendByParent {
 		if warn := warningForPodManagedLabel(w.integrationManager, newPod); warn != "" {
@@ -308,7 +314,92 @@ func validatePodGroupMetadata(p *Pod) field.ErrorList {
 		return append(allErrs, field.Invalid(groupTotalCountAnnotationPath, gtc, err.Error()))
 	}
 
+	return append(allErrs, validateElasticGroupMetadata(p)...)
+}
+
+var (
+	groupMinCountAnnotationPath  = annotationsPath.Key(podconstants.GroupMinCountAnnotation)
+	groupRoleCountAnnotationPath = annotationsPath.Key(podconstants.GroupRoleCountAnnotation)
+	elasticJobAnnotationPath     = annotationsPath.Key(workloadslicing.EnabledAnnotationKey)
+)
+
+// validateElasticGroupMetadata checks the inputs a sliced pod group is built from:
+// the elastic-job annotation needs a group, and the group minimum needs the
+// elastic-job annotation and must stay within the group total count.
+func validateElasticGroupMetadata(p *Pod) field.ErrorList {
+	if !features.Enabled(features.ElasticJobsViaWorkloadSlicesForPodGroups) {
+		return nil
+	}
+	var allErrs field.ErrorList
+	elastic := workloadslicing.Enabled(&p.pod)
+	if elastic && utilpod.GetPodGroupName(&p.pod) == "" {
+		allErrs = append(allErrs, field.Forbidden(elasticJobAnnotationPath, "elastic job requires a pod group"))
+	}
+	requiresElastic := fmt.Sprintf("requires the %q annotation set to %q", workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue)
+	totalCount, totalErr := p.groupTotalCount()
+	// The minimum floors the PodSet its role becomes: the whole group for one
+	// role, the role count when the group has several roles.
+	minBound, minBoundName := totalCount, "group total count"
+	if roleCount, found := p.pod.GetAnnotations()[podconstants.GroupRoleCountAnnotation]; found {
+		switch parsed, err := strconv.Atoi(roleCount); {
+		case !elastic:
+			allErrs = append(allErrs, field.Forbidden(groupRoleCountAnnotationPath, requiresElastic))
+		case err != nil || parsed < 1:
+			allErrs = append(allErrs, field.Invalid(groupRoleCountAnnotationPath, roleCount, "role count should be an integer greater than zero"))
+		case totalErr == nil && parsed > totalCount:
+			allErrs = append(allErrs, field.Invalid(groupRoleCountAnnotationPath, roleCount,
+				fmt.Sprintf("role count should not exceed the group total count %d", totalCount)))
+		default:
+			minBound, minBoundName = parsed, "role count"
+		}
+	}
+	minCount, found := p.pod.GetAnnotations()[podconstants.GroupMinCountAnnotation]
+	if !found {
+		return allErrs
+	}
+	if !elastic {
+		return append(allErrs, field.Forbidden(groupMinCountAnnotationPath, requiresElastic))
+	}
+	parsed, err := strconv.Atoi(minCount)
+	if err != nil || parsed < 1 {
+		return append(allErrs, field.Invalid(groupMinCountAnnotationPath, minCount, "group min count should be an integer greater than zero"))
+	}
+	if totalErr == nil && parsed > minBound {
+		allErrs = append(allErrs, field.Invalid(groupMinCountAnnotationPath, minCount,
+			fmt.Sprintf("group min count should not exceed the %s %d", minBoundName, minBound)))
+	}
 	return allErrs
+}
+
+// validateUpdateForElasticGroupAnnotations keeps the group minimum and the role
+// count immutable: every slice of the group's Workload chain is built from them.
+func validateUpdateForElasticGroupAnnotations(oldPod, newPod *Pod) field.ErrorList {
+	var allErrs field.ErrorList
+	for key, path := range map[string]*field.Path{
+		podconstants.GroupMinCountAnnotation:  groupMinCountAnnotationPath,
+		podconstants.GroupRoleCountAnnotation: groupRoleCountAnnotationPath,
+	} {
+		oldValue, oldFound := oldPod.pod.Annotations[key]
+		newValue, newFound := newPod.pod.Annotations[key]
+		if !oldFound && !newFound {
+			continue
+		}
+		allErrs = append(allErrs, validation.ValidateImmutableField(newValue, oldValue, path)...)
+	}
+	return allErrs
+}
+
+// prepareElasticGroupMember stamps what the elastic-job ungater and the topology
+// ungater key on: the PodSet label (the role hash), the slice-chain name (the
+// group name) and the elastic-job scheduling gate, which keeps a member gated
+// until the active slice's granted count has room for it.
+func (p *Pod) prepareElasticGroupMember() {
+	if p.pod.Labels == nil {
+		p.pod.Labels = make(map[string]string, 1)
+	}
+	p.pod.Labels[constants.PodSetLabel] = string(kueue.NewPodSetReference(p.pod.Annotations[podconstants.RoleHashAnnotation]))
+	metav1.SetMetaDataAnnotation(&p.pod.ObjectMeta, kueue.WorkloadSliceNameAnnotation, utilpod.GetPodGroupName(&p.pod))
+	utilpod.Gate(&p.pod, kueue.ElasticJobSchedulingGate)
 }
 
 func validateTopologyRequest(pod *Pod) field.ErrorList {
