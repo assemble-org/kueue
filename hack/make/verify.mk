@@ -25,6 +25,8 @@ VERIFY_GOMAXPROCS ?= 2
 VERIFY_CLI_BUILD_NPROCS ?= 2
 # Share CPU capacity with platform builds and documentation generation; 0 is unlimited.
 CI_LINT_NPROCS ?= 2
+# Per-module golangci-lint deadline; the root module needs most of it on a shared 7-CPU CI pod.
+GOLANGCI_LINT_TIMEOUT ?= 15m0s
 # Output sync mode for parallel verification. Set to empty to disable.
 # Requires GNU Make 4.0+. Values: target, line, recurse, or empty.
 ifeq ($(shell uname),Darwin)
@@ -146,7 +148,7 @@ define _ci_lint_recipe
 		[ -n "$$dirs" ] || exit 0; \
 		$(GOLANGCI_LINT) run -v $(GOLANGCI_LINT_FIX) \
 			--allow-parallel-runners \
-			--timeout 15m0s \
+			--timeout $(GOLANGCI_LINT_TIMEOUT) \
 			--config "$(PROJECT_DIR)/.golangci.yaml" \
 			$$dirs'
 endef

@@ -32,12 +32,15 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       # The Makefile prefers podman when both are installed. ubuntu-latest ships
       # rootless podman, whose uid mapping cannot write to the mounted artifacts
       # directory from inside the skillsaw container.
       CONTAINER_ENGINE: docker
+      # The root module's golangci-lint shares 4 vCPUs with the other verify
+      # checks here and overran the 15m default on a cold cache.
+      GOLANGCI_LINT_TIMEOUT: 45m0s
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,6 +52,17 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+
+      # golangci-lint keeps per-package analysis results here; a warm cache
+      # turns the root-module lint from tens of minutes into a couple.
+      - name: Restore golangci-lint cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/golangci-lint
+          key: golangci-lint-${{ runner.os }}-${{ hashFiles('go.sum', '.golangci.yaml') }}-${{ github.run_id }}
+          restore-keys: |
+            golangci-lint-${{ runner.os }}-${{ hashFiles('go.sum', '.golangci.yaml') }}-
+            golangci-lint-${{ runner.os }}-
 
       - name: make verify
         run: make verify
