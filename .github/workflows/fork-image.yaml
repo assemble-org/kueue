@@ -63,6 +63,11 @@ jobs:
           GIT_TAG="$(git describe --tags --dirty --always)"
           GIT_COMMIT="$(git rev-parse HEAD)"
           BUILDER_IMAGE="$(grep '^FROM' hack/images/golang/Dockerfile | awk '{print $2}')"
+          # hack/images pins the builder on ECR Public, whose anonymous data quota
+          # is per source IP and shared by every GitHub-hosted runner (429 "Data
+          # limit exceeded"). mirror.gcr.io serves the same Docker Hub official
+          # images under the same digests without an anonymous limit.
+          BUILDER_IMAGE="$(sed 's|^public.ecr.aws/docker/library/|mirror.gcr.io/library/|' <<<"${BUILDER_IMAGE}")"
           BASE_IMAGE="$(grep '^FROM' hack/images/distroless/Dockerfile | awk '{print $2}')"
           {
             echo "tag=${TAG}"
