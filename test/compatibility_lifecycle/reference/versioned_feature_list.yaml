@@ -101,6 +101,12 @@
     lockToDefault: false
     preRelease: Alpha
     version: "0.20"
+- name: ElasticJobsViaWorkloadSlicesForPodGroups
+  versionedSpecs:
+  - default: false
+    lockToDefault: false
+    preRelease: Alpha
+    version: "0.21"
 - name: ElasticJobsViaWorkloadSlicesForProvisioningRequests
   versionedSpecs:
   - default: false

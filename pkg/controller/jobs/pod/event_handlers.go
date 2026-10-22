@@ -165,10 +165,16 @@ func (h *workloadHandler) queueReconcileForChildPod(ctx context.Context, object 
 	}
 	log.V(5).Info("Queueing reconcile for parent pods")
 
-	// Compose request for a pod group if workload has an "is-group-workload" annotation
+	// Compose request for a pod group if workload has an "is-group-workload" annotation.
+	// A slice of an elastic group is named after the group plus a suffix; the
+	// slice-name annotation carries the group name.
 	if w.Annotations[podconstants.IsGroupWorkloadAnnotationKey] == podconstants.IsGroupWorkloadAnnotationValue {
-		log.V(5).Info("Queueing reconcile for the pod group", "groupName", w.Name, "namespace", w.Namespace)
-		q.Add(reconcileRequestForPodGroup(w.Namespace, w.Name))
+		groupName := w.Name
+		if sliceName := w.Annotations[kueue.WorkloadSliceNameAnnotation]; sliceName != "" {
+			groupName = sliceName
+		}
+		log.V(5).Info("Queueing reconcile for the pod group", "groupName", groupName, "namespace", w.Namespace)
+		q.Add(reconcileRequestForPodGroup(w.Namespace, groupName))
 		return
 	}
 

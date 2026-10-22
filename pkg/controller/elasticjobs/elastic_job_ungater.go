@@ -17,10 +17,12 @@ limitations under the License.
 package elasticjobs
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -308,8 +310,7 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
 		room := granted[ps] - ungatedPerPodSet[ps]
 		var toUngate []*corev1.Pod
 		if room > 0 {
-			// Ungate the lowest-named pods first for deterministic behavior.
-			slices.SortFunc(candidates, func(a, b *corev1.Pod) int { return strings.Compare(a.Name, b.Name) })
+			slices.SortFunc(candidates, compareUngateCandidates)
 			toUngate = candidates
 			if int32(len(candidates)) > room {
 				toUngate = candidates[:room]
@@ -325,6 +326,27 @@ func (r *elasticJobUngater) podsToUngate(ctx context.Context, wl *kueue.Workload
 		gated = append(gated, toUngate...)
 	}
 	return gated, nil
+}
+
+// compareUngateCandidates orders candidates by their pod-group index when both
+// carry one, so the members left gated for later growth are the highest indices
+// rather than the lexicographically largest names, and by name otherwise.
+func compareUngateCandidates(a, b *corev1.Pod) int {
+	aIndex, aFound := podGroupIndex(a)
+	bIndex, bFound := podGroupIndex(b)
+	if aFound && bFound && aIndex != bIndex {
+		return cmp.Compare(aIndex, bIndex)
+	}
+	return strings.Compare(a.Name, b.Name)
+}
+
+func podGroupIndex(pod *corev1.Pod) (int, bool) {
+	value, found := pod.Labels[kueue.PodGroupPodIndexLabel]
+	if !found {
+		return 0, false
+	}
+	index, err := strconv.Atoi(value)
+	return index, err == nil
 }
 
 // Workload predicates
