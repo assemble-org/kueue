@@ -33,6 +33,11 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # The Makefile prefers podman when both are installed. ubuntu-latest ships
+      # rootless podman, whose uid mapping cannot write to the mounted artifacts
+      # directory from inside the skillsaw and shellcheck containers.
+      CONTAINER_ENGINE: docker
     steps:
       - name: Checkout
         uses: actions/checkout@v4
