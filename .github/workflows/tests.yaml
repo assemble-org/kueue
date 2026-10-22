@@ -36,7 +36,7 @@ jobs:
     env:
       # The Makefile prefers podman when both are installed. ubuntu-latest ships
       # rootless podman, whose uid mapping cannot write to the mounted artifacts
-      # directory from inside the skillsaw and shellcheck containers.
+      # directory from inside the skillsaw container.
       CONTAINER_ENGINE: docker
     steps:
       - name: Checkout
