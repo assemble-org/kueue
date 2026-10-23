@@ -257,3 +257,14 @@ type JobWithCustomQueueNameChange interface {
 	// to customize the workload queue-name using custom logic.
 	CustomQueueNameChange(ctx context.Context, c client.Client, wl *kueue.Workload) error
 }
+
+// JobWithMemberCleanup is an optional interface for composable jobs whose
+// members can outlive their place in the Workload: finished members a newer
+// member replaced, and active members beyond a PodSet's count. The reconciler
+// calls it with a Workload it matched outside FindMatchingWorkloads, as on the
+// workload-slice path, so those members are released the same way.
+type JobWithMemberCleanup interface {
+	// CleanupMembers deletes the members beyond the Workload's PodSet counts
+	// and finalizes the finished members a newer member has replaced.
+	CleanupMembers(ctx context.Context, c client.Client, r events.EventRecorder, wl *kueue.Workload) error
+}

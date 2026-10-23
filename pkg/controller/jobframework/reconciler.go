@@ -1222,6 +1222,14 @@ func (r *JobReconciler) ensureOneWorkload(ctx context.Context, job GenericJob, o
 						wl = admitted
 					}
 				}
+				// FindMatchingWorkloads is not reached on this path, so release
+				// the replaced and excess members here before the kept ones
+				// take ownership of the slice.
+				if cleaner, implements := job.(JobWithMemberCleanup); implements {
+					if err := cleaner.CleanupMembers(ctx, r.client, r.record, wl); err != nil {
+						return nil, err
+					}
+				}
 				if err := cj.EnsureWorkloadOwnedByAllMembers(ctx, r.client, r.record, wl); err != nil {
 					return nil, err
 				}

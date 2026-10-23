@@ -1943,14 +1943,57 @@ func (p *Pod) FindMatchingWorkloads(ctx context.Context, c client.Client, r even
 		return nil, []*kueue.Workload{workload}, nil
 	}
 
-	// Cleanup excess pods for each workload pod set (role)
+	members, err := p.partitionGroupMembers(workload)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	jobPodSets, err := constructGroupPodSets(members.kept, podSetReferenceOrder(workload.Spec.PodSets))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if len(members.kept) == 0 || !p.equivalentToWorkload(workload, jobPodSets) {
+		return nil, []*kueue.Workload{workload}, nil
+	}
+
+	// Do not clean up more pods until observing previous operations
+	if !p.satisfiedExcessPods {
+		return nil, nil, errPendingOps
+	}
+
+	p.absentPods = members.absent
+	p.list.Items = members.kept
+	if err := p.EnsureWorkloadOwnedByAllMembers(ctx, c, r, workload); err != nil {
+		return nil, nil, err
+	}
+
+	if err := p.removeExcessPods(ctx, c, r, members.excess); err != nil {
+		return nil, nil, err
+	}
+
+	if err := p.finalizePods(ctx, c, members.replaced); err != nil {
+		return nil, nil, err
+	}
+	return workload, []*kueue.Workload{}, nil
+}
+
+// groupMembers is the group's pods partitioned against a Workload's PodSets.
+type groupMembers struct {
+	// kept are the members of the Workload, by role.
+	kept []corev1.Pod
+	// excess are the active pods beyond a role's count, the youngest first.
+	excess []corev1.Pod
+	// replaced are the inactive pods a newer pod of their role stands in for.
+	replaced []corev1.Pod
+	// absent is how many members the roles are still missing.
+	absent int
+}
+
+func (p *Pod) partitionGroupMembers(workload *kueue.Workload) (groupMembers, error) {
 	activePods, inactivePods := p.partitionPods()
 
-	var absentPods int
-	var keptPods []corev1.Pod
-	var excessActivePods []corev1.Pod
-	var replacedInactivePods []corev1.Pod
-
+	var members groupMembers
 	for _, ps := range workload.Spec.PodSets {
 		// Find all the active and inactive pods of the role
 		var roleHashErrors []error
@@ -1965,56 +2008,53 @@ func (p *Pod) FindMatchingWorkloads(ctx context.Context, c client.Client, r even
 		roleActivePods := utilslices.Pick(activePods, hasRoleFunc)
 		roleInactivePods := utilslices.Pick(inactivePods, hasRoleFunc)
 		if len(roleHashErrors) > 0 {
-			return nil, nil, errRoleHashCalculation(roleHashErrors)
+			return groupMembers{}, errRoleHashCalculation(roleHashErrors)
 		}
 
-		absentPods += p.countAbsentPods(ps, len(roleActivePods))
+		members.absent += p.countAbsentPods(ps, len(roleActivePods))
 
 		if excessCount := len(roleActivePods) - int(ps.Count); excessCount > 0 {
 			sortActivePods(roleActivePods)
-			excessActivePods = append(excessActivePods, roleActivePods[len(roleActivePods)-excessCount:]...)
-			keptPods = append(keptPods, roleActivePods[:len(roleActivePods)-excessCount]...)
+			members.excess = append(members.excess, roleActivePods[len(roleActivePods)-excessCount:]...)
+			members.kept = append(members.kept, roleActivePods[:len(roleActivePods)-excessCount]...)
 		} else {
-			keptPods = append(keptPods, roleActivePods...)
+			members.kept = append(members.kept, roleActivePods...)
 		}
 
 		if finalizeablePodsCount := min(len(roleInactivePods), len(roleInactivePods)+len(roleActivePods)-int(ps.Count)); finalizeablePodsCount > 0 {
 			sortInactivePods(p.clock, roleInactivePods)
-			replacedInactivePods = append(replacedInactivePods, roleInactivePods[len(roleInactivePods)-finalizeablePodsCount:]...)
-			keptPods = append(keptPods, roleInactivePods[:len(roleInactivePods)-finalizeablePodsCount]...)
+			members.replaced = append(members.replaced, roleInactivePods[len(roleInactivePods)-finalizeablePodsCount:]...)
+			members.kept = append(members.kept, roleInactivePods[:len(roleInactivePods)-finalizeablePodsCount]...)
 		} else {
-			keptPods = append(keptPods, roleInactivePods...)
+			members.kept = append(members.kept, roleInactivePods...)
 		}
 	}
+	return members, nil
+}
 
-	jobPodSets, err := constructGroupPodSets(keptPods, podSetReferenceOrder(workload.Spec.PodSets))
+// CleanupMembers releases the group's pods that have no place in the Workload:
+// active pods beyond a role's count are deleted and the inactive pods a newer
+// member replaced are finalized, as FindMatchingWorkloads does for a Workload
+// it matched itself. The reconciler calls it with the Workload it found on the
+// workload-slice path, which a group reaches without FindMatchingWorkloads.
+func (p *Pod) CleanupMembers(ctx context.Context, c client.Client, r events.EventRecorder, workload *kueue.Workload) error {
+	if !p.isGroup {
+		return nil
+	}
+	members, err := p.partitionGroupMembers(workload)
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
-
-	if len(keptPods) == 0 || !p.equivalentToWorkload(workload, jobPodSets) {
-		return nil, []*kueue.Workload{workload}, nil
-	}
-
 	// Do not clean up more pods until observing previous operations
-	if !p.satisfiedExcessPods {
-		return nil, nil, errPendingOps
+	if (len(members.excess) > 0 || len(members.replaced) > 0) && !p.satisfiedExcessPods {
+		return errPendingOps
 	}
-
-	p.absentPods = absentPods
-	p.list.Items = keptPods
-	if err := p.EnsureWorkloadOwnedByAllMembers(ctx, c, r, workload); err != nil {
-		return nil, nil, err
+	p.absentPods = members.absent
+	p.list.Items = members.kept
+	if err := p.removeExcessPods(ctx, c, r, members.excess); err != nil {
+		return err
 	}
-
-	if err := p.removeExcessPods(ctx, c, r, excessActivePods); err != nil {
-		return nil, nil, err
-	}
-
-	if err := p.finalizePods(ctx, c, replacedInactivePods); err != nil {
-		return nil, nil, err
-	}
-	return workload, []*kueue.Workload{}, nil
+	return p.finalizePods(ctx, c, members.replaced)
 }
 
 func (p *Pod) countAbsentPods(ps kueue.PodSet, activePods int) int {

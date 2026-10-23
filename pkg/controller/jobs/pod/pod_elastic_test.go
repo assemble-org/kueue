@@ -17,15 +17,21 @@ limitations under the License.
 package pod
 
 import (
+	"errors"
 	"fmt"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/component-base/featuregate"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
@@ -35,7 +41,9 @@ import (
 	podconstants "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/podset"
+	"sigs.k8s.io/kueue/pkg/util/expectations"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
+	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
 	"sigs.k8s.io/kueue/pkg/workloadslicing"
 )
@@ -562,5 +570,108 @@ func TestWorkloadSliceNameElasticGroup(t *testing.T) {
 	plain := testingpod.MakePod("grp-0", elasticTestNamespace).GroupNameLabel(elasticTestGroup).GroupTotalCount("4").Obj()
 	if got := elasticGroup(plain).WorkloadSliceName(); got != "" {
 		t.Errorf("WorkloadSliceName() = %q for a plain group, want empty", got)
+	}
+}
+
+// TestCleanupMembersElasticGroup covers the member cleanup the reconciler runs on
+// the workload-slice path, where a group never reaches FindMatchingWorkloads.
+func TestCleanupMembersElasticGroup(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	slice := utiltestingapi.MakeWorkload(elasticTestGroup, elasticTestNamespace).Group().
+		PodSets(*utiltestingapi.MakePodSet(kueue.NewPodSetReference(elasticTestRoleHash), 4).Obj()).
+		Obj()
+	running := func(name string, age time.Duration) *corev1.Pod {
+		return elasticGroupMember(name).UID(name).KueueFinalizer().
+			CreationTimestamp(now.Add(-age)).StatusPhase(corev1.PodRunning).Obj()
+	}
+	// A member that failed and was deleted: Kueue's finalizer is all that keeps it.
+	failed := func(name string) *corev1.Pod {
+		return elasticGroupMember(name).UID(name).KueueFinalizer().
+			CreationTimestamp(now.Add(-time.Hour)).StatusPhase(corev1.PodFailed).
+			DeletionTimestamp(now).Obj()
+	}
+	threeRunning := func() []*corev1.Pod {
+		return []*corev1.Pod{
+			running("grp-0", time.Hour),
+			running("grp-1", time.Hour),
+			running("grp-2", time.Hour),
+		}
+	}
+	testCases := map[string]struct {
+		pods       []*corev1.Pod
+		pendingOps bool
+		wantErr    error
+		wantGone   []string
+		wantKept   []string
+		wantAbsent int
+	}{
+		"the failed member its replacement stands in for is finalized": {
+			pods:     append(threeRunning(), failed("grp-3"), running("grp-3-r", time.Minute)),
+			wantGone: []string{"grp-3"},
+			wantKept: []string{"grp-0", "grp-1", "grp-2", "grp-3-r"},
+		},
+		"the youngest active member beyond the role count is deleted": {
+			pods:     append(threeRunning(), running("grp-3", time.Hour), running("grp-4", time.Minute)),
+			wantGone: []string{"grp-4"},
+			wantKept: []string{"grp-0", "grp-1", "grp-2", "grp-3"},
+		},
+		"a failed member stays until something replaces it": {
+			pods:       append(threeRunning(), failed("grp-3")),
+			wantKept:   []string{"grp-0", "grp-1", "grp-2", "grp-3"},
+			wantAbsent: 1,
+		},
+		"nothing is released before earlier operations on pods are observed": {
+			pods:       append(threeRunning(), failed("grp-3"), running("grp-3-r", time.Minute)),
+			pendingOps: true,
+			wantErr:    errPendingOps,
+			wantKept:   []string{"grp-0", "grp-1", "grp-2", "grp-3", "grp-3-r"},
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			features.SetFeatureGatesDuringTest(t, elasticGroupGates)
+			ctx, _ := utiltesting.ContextWithLog(t)
+			objects := make([]client.Object, 0, len(tc.pods))
+			for _, pod := range tc.pods {
+				objects = append(objects, pod.DeepCopy())
+			}
+			cli := utiltesting.NewClientBuilder().WithObjects(objects...).Build()
+
+			group := elasticGroup(tc.pods...)
+			group.key = types.NamespacedName{Namespace: elasticTestNamespace, Name: elasticTestGroup}
+			group.excessPodExpectations = expectations.NewStore("test")
+			group.satisfiedExcessPods = !tc.pendingOps
+			group.clock = realClock
+			recorder := &utiltesting.EventRecorder{}
+
+			err := group.CleanupMembers(ctx, cli, recorder, slice)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("CleanupMembers() error = %v, want %v", err, tc.wantErr)
+			}
+			for _, pod := range tc.pods {
+				var got corev1.Pod
+				getErr := cli.Get(ctx, client.ObjectKeyFromObject(pod), &got)
+				gone := slices.Contains(tc.wantGone, pod.Name)
+				switch {
+				case gone && !apierrors.IsNotFound(getErr):
+					t.Errorf("pod %s: still exists (err=%v), want it released", pod.Name, getErr)
+				case !gone && getErr != nil:
+					t.Errorf("pod %s: get error %v, want it kept", pod.Name, getErr)
+				case !gone && !slices.Contains(got.Finalizers, podconstants.PodFinalizer):
+					t.Errorf("pod %s: finalizer removed, want it kept", pod.Name)
+				}
+			}
+			var kept []string
+			for i := range group.list.Items {
+				kept = append(kept, group.list.Items[i].Name)
+			}
+			slices.Sort(kept)
+			if diff := cmp.Diff(tc.wantKept, kept); diff != "" {
+				t.Errorf("kept members (-want +got):\n%s", diff)
+			}
+			if group.absentPods != tc.wantAbsent {
+				t.Errorf("absentPods = %d, want %d", group.absentPods, tc.wantAbsent)
+			}
+		})
 	}
 }
