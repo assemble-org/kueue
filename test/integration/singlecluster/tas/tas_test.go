@@ -2272,6 +2272,155 @@ var _ = ginkgo.Describe("Topology Aware Scheduling", func() {
 				})
 			})
 
+			ginkgo.When("A PodSet may fail over to another rack", func() {
+				var nodes []corev1.Node
+
+				rackNode := func(name, rack string) corev1.Node {
+					return *testingnode.MakeNode(name).
+						Label("node-group", "tas").
+						Label(utiltesting.DefaultBlockTopologyLevel, "b1").
+						Label(utiltesting.DefaultRackTopologyLevel, rack).
+						Label(corev1.LabelHostname, name).
+						StatusAllocatable(corev1.ResourceList{
+							corev1.ResourceCPU:  resource.MustParse("1"),
+							corev1.ResourcePods: resource.MustParse("10"),
+						}).
+						Ready().
+						Obj()
+				}
+
+				ginkgo.BeforeEach(func() {
+					features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.ElasticJobsViaWorkloadSlicesDomainFailover, true)
+					// Lets an elastic Workload carry minCount on several PodSets.
+					features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp, true)
+					features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.TASReplaceMultipleFailedNodes, true)
+					features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.TASFailedNodeReplacementFailFast, false)
+
+					//   ra: a1 a2    rb: b1 b2 b3    rc: c1 c2 c3 c4
+					nodes = []corev1.Node{
+						rackNode("a1", "ra"), rackNode("a2", "ra"),
+						rackNode("b1", "rb"), rackNode("b2", "rb"), rackNode("b3", "rb"),
+						rackNode("c1", "rc"), rackNode("c2", "rc"), rackNode("c3", "rc"), rackNode("c4", "rc"),
+					}
+					integration.CreateNodesWithStatus(ctx, k8sClient, nodes)
+
+					topology = utiltestingapi.MakeDefaultThreeLevelTopology("default")
+					behavioral.MustCreate(ctx, k8sClient, topology)
+
+					tasFlavor = utiltestingapi.MakeResourceFlavor("tas-flavor").
+						NodeLabel("node-group", "tas").
+						TopologyName("default").Obj()
+					behavioral.MustCreate(ctx, k8sClient, tasFlavor)
+
+					clusterQueue = utiltestingapi.MakeClusterQueue("cluster-queue").
+						ResourceGroup(*utiltestingapi.MakeFlavorQuotas(tasFlavor.Name).Resource(corev1.ResourceCPU, "9").Obj()).
+						Obj()
+					behavioral.MustCreate(ctx, k8sClient, clusterQueue)
+					behavioral.ExpectClusterQueuesToBeActive(ctx, k8sClient, clusterQueue)
+
+					localQueue = utiltestingapi.MakeLocalQueue("local-queue", ns.Name).ClusterQueue(clusterQueue.Name).Obj()
+					behavioral.MustCreate(ctx, k8sClient, localQueue)
+				})
+
+				ginkgo.AfterEach(func() {
+					gomega.Expect(behavioral.DeleteWorkloadsInNamespace(ctx, k8sClient, ns)).Should(gomega.Succeed())
+					gomega.Expect(behavioral.DeleteObject(ctx, k8sClient, localQueue)).Should(gomega.Succeed())
+					behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, clusterQueue, true)
+					behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, tasFlavor, true)
+					behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, topology, true)
+					for _, node := range nodes {
+						behavioral.ExpectObjectToBeDeleted(ctx, k8sClient, &node, true)
+					}
+					metrics.ClearClusterQueueMetrics(kueue.ClusterQueueReference(clusterQueue.Name))
+				})
+
+				ginkgo.It("should move a PodSet to another rack once its rack cannot reach the PodSet minimum", framework.SlowSpec, func() {
+					var wl *kueue.Workload
+					hostnames := func(names ...string) *kueue.TopologyAssignment {
+						domains := make([]utiltas.TopologyDomainAssignment, len(names))
+						for i, name := range names {
+							domains[i] = utiltas.TopologyDomainAssignment{Count: 1, Values: []string{name}}
+						}
+						return utiltas.V1Beta2From(&utiltas.TopologyAssignment{Levels: []string{corev1.LabelHostname}, Domains: domains})
+					}
+					failNode := func(name string) {
+						node := &corev1.Node{}
+						gomega.Expect(k8sClient.Get(ctx, apitypes.NamespacedName{Name: name}, node)).Should(gomega.Succeed())
+						behavioral.SetNodeCondition(ctx, k8sClient, node, &corev1.NodeCondition{
+							Type:               corev1.NodeReady,
+							Status:             corev1.ConditionFalse,
+							LastTransitionTime: metav1.NewTime(time.Now().Add(-tas.NodeFailureDelay)),
+						})
+					}
+
+					ginkgo.By("creating an elastic workload with two rack-bound PodSets opted into domain failover", func() {
+						wl = utiltestingapi.MakeWorkload("wl", ns.Name).
+							Annotation(constants.ElasticJobAnnotation, "true").
+							Annotation(constants.ElasticJobDomainFailoverAnnotationKey, constants.ElasticJobDomainFailoverAnnotationValue).
+							PodSets(
+								*utiltestingapi.MakePodSet("r0", 2).
+									RequiredTopologyRequest(utiltesting.DefaultRackTopologyLevel).
+									SetMinimumCount(2).
+									Request(corev1.ResourceCPU, "1").Obj(),
+								*utiltestingapi.MakePodSet("r1", 3).
+									RequiredTopologyRequest(utiltesting.DefaultRackTopologyLevel).
+									SetMinimumCount(2).
+									Request(corev1.ResourceCPU, "1").Obj(),
+							).
+							Queue(kueue.LocalQueueName(localQueue.Name)).Obj()
+						behavioral.MustCreate(ctx, k8sClient, wl)
+					})
+
+					ginkgo.By("verifying r0 is admitted in rack ra and r1 in rack rb", func() {
+						behavioral.ExpectWorkloadsToBeAdmitted(ctx, k8sClient, wl)
+						gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), wl)).To(gomega.Succeed())
+						gomega.Expect(wl.Status.Admission.PodSetAssignments[0].TopologyAssignment).Should(gomega.BeComparableTo(hostnames("a1", "a2")))
+						gomega.Expect(wl.Status.Admission.PodSetAssignments[1].TopologyAssignment).Should(gomega.BeComparableTo(hostnames("b1", "b2", "b3")))
+					})
+
+					ginkgo.By("failing one rack-rb node, which leaves the rack able to reach the minimum of 2", func() {
+						failNode("b1")
+						behavioral.ExpectAdmittedWorkloadWithUnhealthyNodes(ctx, k8sClient, wl, "b1")
+					})
+
+					ginkgo.By("keeping r1 in rack rb while the replacement waits", func() {
+						gomega.Eventually(func(g gomega.Gomega) {
+							events, err := behavioral.EventsForObject(ctx, k8sClient, client.ObjectKeyFromObject(wl))
+							g.Expect(err).NotTo(gomega.HaveOccurred())
+							g.Expect(events).To(gomega.ContainElement(gomega.HaveField("Reason", "SecondPassFailed")))
+						}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
+						gomega.Consistently(func(g gomega.Gomega) {
+							g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), wl)).To(gomega.Succeed())
+							g.Expect(wl.Status.Admission.PodSetAssignments[1].TopologyAssignment).Should(gomega.BeComparableTo(hostnames("b1", "b2", "b3")))
+							g.Expect(wl.Status.UnhealthyNodes).To(gomega.Equal([]kueue.UnhealthyNode{{Name: "b1"}}))
+						}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
+					})
+
+					ginkgo.By("failing a second rack-rb node, which leaves the rack below the minimum", func() {
+						failNode("b2")
+					})
+
+					ginkgo.By("verifying r1 moved to rack rc, r0 kept its nodes and nothing is left to replace", func() {
+						gomega.Eventually(func(g gomega.Gomega) {
+							g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), wl)).To(gomega.Succeed())
+							g.Expect(wl.Status.Admission.PodSetAssignments[0].TopologyAssignment).Should(gomega.BeComparableTo(hostnames("a1", "a2")))
+							moved := utiltas.InternalFrom(wl.Status.Admission.PodSetAssignments[1].TopologyAssignment)
+							g.Expect(moved.Domains).To(gomega.HaveLen(3))
+							for _, domain := range moved.Domains {
+								g.Expect(domain.Values).To(gomega.HaveLen(1))
+								g.Expect(domain.Values[0]).To(gomega.HavePrefix("c"))
+							}
+							g.Expect(wl.Status.UnhealthyNodes).To(gomega.BeEmpty())
+						}, behavioral.Timeout, behavioral.Interval).Should(gomega.Succeed())
+						behavioral.ExpectEventAppeared(ctx, k8sClient, eventsv1.Event{
+							Reason: "TopologyDomainFailover",
+							Type:   corev1.EventTypeNormal,
+							Note:   `PodSet r1 moved from cloud.provider.com/topology-rack "b1,rb" to "b1,rc": "b1,rb" can run 1 of the 2 pods the PodSet needs at minimum`,
+						})
+					})
+				})
+			})
+
 			ginkgo.When("Nodes are created before test with the hostname being the lowest level", func() {
 				var (
 					nodes            []corev1.Node

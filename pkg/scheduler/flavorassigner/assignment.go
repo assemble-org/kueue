@@ -82,6 +82,7 @@ func (a *Assignment) UpdateForTASResult(log logr.Logger, cq *schdcache.ClusterQu
 	for psName, psResult := range result {
 		psAssignment := a.podSetAssignmentByName(psName)
 		psAssignment.TopologyAssignment = psResult.TopologyAssignment
+		psAssignment.DomainFailover = psResult.DomainFailover
 		if psResult.TopologyAssignment != nil && psAssignment.DelayedTopologyRequest != nil {
 			psAssignment.DelayedTopologyRequest = new(kueue.DelayedTopologyRequestStateReady)
 		}
@@ -478,6 +479,9 @@ type PodSetAssignment struct {
 
 	TopologyAssignment     *tas.TopologyAssignment
 	DelayedTopologyRequest *kueue.DelayedTopologyRequestState
+	// DomainFailover is set when TopologyAssignment moves the PodSet out of
+	// the topology domain its members were running in.
+	DomainFailover *schdcache.DomainFailover
 
 	FlavorAssignmentAttempts []FlavorAssignmentAttempt
 }

@@ -95,4 +95,11 @@ const (
 
 	ElasticJobScaleUpStrategyAtomic  = "atomic"
 	ElasticJobScaleUpStrategyPartial = "partial"
+
+	// ElasticJobDomainFailoverAnnotationKey is set on an elastic Job with required
+	// topology to let a PodSet move to another topology domain when the domain
+	// its members run in can no longer host the PodSet's minimum count.
+	// This annotation is alpha-level.
+	ElasticJobDomainFailoverAnnotationKey   = "kueue.x-k8s.io/elastic-job-domain-failover"
+	ElasticJobDomainFailoverAnnotationValue = "true"
 )

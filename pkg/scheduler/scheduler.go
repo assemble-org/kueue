@@ -62,6 +62,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/util/resourcegroups"
 	"sigs.k8s.io/kueue/pkg/util/roletracker"
 	"sigs.k8s.io/kueue/pkg/util/routine"
+	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
 	"sigs.k8s.io/kueue/pkg/util/wait"
 	"sigs.k8s.io/kueue/pkg/workload"
 	"sigs.k8s.io/kueue/pkg/workload/concurrentadmission"
@@ -1032,6 +1033,12 @@ func (s *Scheduler) admit(ctx context.Context, e *entry, cq *schdcache.ClusterQu
 			if e.assignment.ZeroCountFlavorFallback != "" && !workload.HasQuotaReservation(e.Obj) {
 				s.recorder.Eventf(newWorkload, nil, corev1.EventTypeWarning, "ZeroCountFlavorFallback", "ZeroCountFlavorFallback", api.TruncateEventMessage(e.assignment.ZeroCountFlavorFallback))
 			}
+			for i := range e.assignment.PodSets {
+				if failover := e.assignment.PodSets[i].DomainFailover; failover != nil {
+					s.recorder.Eventf(newWorkload, nil, corev1.EventTypeNormal, "TopologyDomainFailover", "TopologyDomainFailover",
+						api.TruncateEventMessage(failover.Message(e.assignment.PodSets[i].Name)))
+				}
+			}
 
 			log.V(2).Info("Workload successfully admitted and assigned flavors", "assignments", admission.PodSetAssignments)
 			if features.Enabled(features.ElasticJobsViaWorkloadSlices) && oldWorkloadSlice != nil {
@@ -1108,6 +1115,13 @@ func updateUnhealthyNodesAfterTASReplacement(log logr.Logger, wl *kueue.Workload
 		wl.Status.UnhealthyNodes = slices.DeleteFunc(wl.Status.UnhealthyNodes, func(n kueue.UnhealthyNode) bool {
 			return n.Name == replacedNodeName
 		})
+		if features.Enabled(features.ElasticJobsViaWorkloadSlicesDomainFailover) {
+			// A PodSet moved to another topology domain leaves the rest of its
+			// unhealthy nodes behind; nothing is left to replace on them.
+			wl.Status.UnhealthyNodes = slices.DeleteFunc(wl.Status.UnhealthyNodes, func(n kueue.UnhealthyNode) bool {
+				return !utiltas.HasTASAssignmentOnNode(wl.Status.Admission, n.Name)
+			})
+		}
 		log.V(5).Info("Dropping the replaced head node from the workload recovery field, keeping the remaining unhealthy nodes",
 			"replacedNode", replacedNodeName,
 			"remainingUnhealthyNodes", len(wl.Status.UnhealthyNodes))

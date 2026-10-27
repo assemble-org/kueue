@@ -1790,6 +1790,16 @@ func IsElasticWorkload(wl *kueue.Workload) bool {
 	return features.Enabled(features.ElasticJobsViaWorkloadSlices) && wl.GetAnnotations()[constants.ElasticJobAnnotation] == "true"
 }
 
+// DomainFailoverEnabled reports whether a PodSet of the Workload may be moved to
+// another topology domain when the domain its members run in can no longer host
+// the PodSet's minimum count. The annotation is copied from the Job onto every
+// slice of its Workload chain.
+func DomainFailoverEnabled(wl *kueue.Workload) bool {
+	return features.Enabled(features.ElasticJobsViaWorkloadSlicesDomainFailover) &&
+		IsElasticWorkload(wl) &&
+		wl.GetAnnotations()[constants.ElasticJobDomainFailoverAnnotationKey] == constants.ElasticJobDomainFailoverAnnotationValue
+}
+
 // MinCountsUsable reports whether PodSet.MinCount is honored for the given Workload, i.e. whether
 // the workload may be partially admitted. MinCount is populated by two independent mechanisms, each
 // with its own feature gate: PartialAdmission (classic, e.g. batch/Job's job-min-parallelism) and

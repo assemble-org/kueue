@@ -32,6 +32,7 @@ import (
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	schddra "sigs.k8s.io/kueue/pkg/cache/scheduler/dra"
+	kueueconstants "sigs.k8s.io/kueue/pkg/constants"
 	coreindexer "sigs.k8s.io/kueue/pkg/controller/core/indexer"
 	podconstants "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
 	tasindexer "sigs.k8s.io/kueue/pkg/controller/tas/indexer"
@@ -62,8 +63,10 @@ type PodSetTestCase struct {
 	podSetUpdates      []*kueue.PodSetUpdate
 	podSetGroupName    *string
 	previousAssignment *kueue.TopologyAssignment
+	minCount           *int32
 	wantAssignment     *tas.TopologyAssignment
 	wantReason         string
+	wantDomainFailover *DomainFailover
 }
 
 func TestFindTopologyAssignments(t *testing.T) {
@@ -553,6 +556,66 @@ func TestFindTopologyAssignments(t *testing.T) {
 			).
 			Obj())
 
+	// Domain failover fixtures: a PodSet of 3 admitted in rack r1 (x1, x2,
+	// x3), with x1 and x2 queued for replacement. r2 (y*) and r3 (z*) are the
+	// racks it may move to; their sizes vary per case.
+	domainFailoverGates := map[featuregate.Feature]bool{
+		features.ElasticJobsViaWorkloadSlicesDomainFailover: true,
+		features.TASReplaceMultipleFailedNodes:              true,
+	}
+	domainFailoverNode := func(rack, name string, ready bool) corev1.Node {
+		node := testingnode.MakeNode(name).
+			Label(tasRackLabel, rack).
+			Label(corev1.LabelHostname, name).
+			StatusAllocatable(corev1.ResourceList{
+				"example.com/gpu":   resource.MustParse("1"),
+				corev1.ResourcePods: resource.MustParse("10"),
+			})
+		if ready {
+			node.Ready()
+		} else {
+			node.NotReady()
+		}
+		return *node.Obj()
+	}
+	domainFailoverNodes := func(x3Ready bool, r2Size, r3Size int) []corev1.Node {
+		nodes := []corev1.Node{
+			domainFailoverNode("r1", "x1", false),
+			domainFailoverNode("r1", "x2", false),
+			domainFailoverNode("r1", "x3", x3Ready),
+		}
+		for i := range r2Size {
+			nodes = append(nodes, domainFailoverNode("r2", fmt.Sprintf("y%d", i+1), true))
+		}
+		for i := range r3Size {
+			nodes = append(nodes, domainFailoverNode("r3", fmt.Sprintf("z%d", i+1), true))
+		}
+		return nodes
+	}
+	// The PodSet's own member keeps x3 full.
+	domainFailoverFillerPod := func(nodeName string) *corev1.Pod {
+		return testingpod.MakePod("filler-"+nodeName, "test-ns").NodeName(nodeName).Request("example.com/gpu", "1").Obj()
+	}
+	domainFailoverWorkload := func(optIn bool, unhealthyNodes ...string) *kueue.Workload {
+		wl := utiltestingapi.MakeWorkload("test-wl", "test-ns").
+			Annotation(kueueconstants.ElasticJobAnnotation, "true").
+			Admission(utiltestingapi.MakeAdmission("test-cq", "main").
+				PodSets(utiltestingapi.MakePodSetAssignment("main").
+					Count(3).
+					TopologyAssignment(utiltestingapi.MakeTopologyAssignment(defaultOneLevel).
+						Domain(tas.TopologyDomainAssignment{Count: 1, Values: []string{"x1"}}).
+						Domain(tas.TopologyDomainAssignment{Count: 1, Values: []string{"x2"}}).
+						Domain(tas.TopologyDomainAssignment{Count: 1, Values: []string{"x3"}}).
+						Obj()).
+					Obj()).
+				Obj()).
+			UnhealthyNodes(unhealthyNodes...)
+		if optIn {
+			wl.Annotation(kueueconstants.ElasticJobDomainFailoverAnnotationKey, kueueconstants.ElasticJobDomainFailoverAnnotationValue)
+		}
+		return wl.Obj()
+	}
+
 	cases := map[string]struct {
 		featureGates           map[featuregate.Feature]bool
 		nodes                  []corev1.Node
@@ -579,6 +642,100 @@ func TestFindTopologyAssignments(t *testing.T) {
 		draObjects []client.Object
 		podSets    []PodSetTestCase
 	}{
+		"domain failover: the PodSet moves when its domain cannot reach the minimum": {
+			// Rack r1 held x1, x2 and x3; x1 and x2 failed and x3 is full, so r1
+			// can run 1 of the 2 pods the PodSet needs. r2 and r3 both fit the
+			// whole PodSet.
+			featureGates: domainFailoverGates,
+			nodes:        domainFailoverNodes(true, 3, 3),
+			pods:         []corev1.Pod{*domainFailoverFillerPod("x3")},
+			levels:       []string{tasRackLabel, corev1.LabelHostname},
+			workload:     domainFailoverWorkload(true, "x1", "x2"),
+			podSets: []PodSetTestCase{{
+				podSetName:      "main",
+				topologyRequest: &kueue.PodSetTopologyRequest{Required: new(string(tasRackLabel))},
+				requests:        map[corev1.ResourceName]int64{"example.com/gpu": 1},
+				count:           3,
+				minCount:        new(int32(2)),
+				wantAssignment: &tas.TopologyAssignment{
+					Levels: defaultOneLevel,
+					Domains: []tas.TopologyDomainAssignment{
+						{Count: 1, Values: []string{"y1"}},
+						{Count: 1, Values: []string{"y2"}},
+						{Count: 1, Values: []string{"y3"}},
+					},
+				},
+				wantDomainFailover: &DomainFailover{Level: tasRackLabel, From: "r1", To: "r2", MinCount: 2, HealthyCount: 1},
+			}},
+		},
+		"domain failover: a domain that can still reach the minimum waits for its repair": {
+			featureGates: domainFailoverGates,
+			nodes:        domainFailoverNodes(true, 3, 3),
+			pods:         []corev1.Pod{*domainFailoverFillerPod("x3")},
+			levels:       []string{tasRackLabel, corev1.LabelHostname},
+			workload:     domainFailoverWorkload(true, "x1", "x2"),
+			podSets: []PodSetTestCase{{
+				podSetName:      "main",
+				topologyRequest: &kueue.PodSetTopologyRequest{Required: new(string(tasRackLabel))},
+				requests:        map[corev1.ResourceName]int64{"example.com/gpu": 1},
+				count:           3,
+				minCount:        new(int32(1)),
+				wantReason:      `topology "default" doesn't allow to fit any of 1 pod(s). Total nodes: 7; excluded: resource "example.com/gpu": 1, topologyDomain: 6`,
+			}},
+		},
+		"domain failover: the PodSet waits when no other domain fits all of it": {
+			featureGates: domainFailoverGates,
+			nodes:        domainFailoverNodes(true, 2, 2),
+			pods:         []corev1.Pod{*domainFailoverFillerPod("x3")},
+			levels:       []string{tasRackLabel, corev1.LabelHostname},
+			workload:     domainFailoverWorkload(true, "x1", "x2"),
+			podSets: []PodSetTestCase{{
+				podSetName:      "main",
+				topologyRequest: &kueue.PodSetTopologyRequest{Required: new(string(tasRackLabel))},
+				requests:        map[corev1.ResourceName]int64{"example.com/gpu": 1},
+				count:           3,
+				minCount:        new(int32(2)),
+				wantReason: `cannot replace the node in topology domain "r1", which can run 1 of the 2 pods PodSet main needs at minimum, ` +
+					`and no other domain fits its 3 pods: topology "default" allows to fit only 2 out of 3 pod(s). Total nodes: 5; excluded: resource "example.com/gpu": 1`,
+			}},
+		},
+		"domain failover: a PodSet whose whole domain failed moves": {
+			featureGates: domainFailoverGates,
+			nodes:        domainFailoverNodes(false, 3, 3),
+			levels:       []string{tasRackLabel, corev1.LabelHostname},
+			workload:     domainFailoverWorkload(true, "x1", "x2", "x3"),
+			podSets: []PodSetTestCase{{
+				podSetName:      "main",
+				topologyRequest: &kueue.PodSetTopologyRequest{Required: new(string(tasRackLabel))},
+				requests:        map[corev1.ResourceName]int64{"example.com/gpu": 1},
+				count:           3,
+				minCount:        new(int32(2)),
+				wantAssignment: &tas.TopologyAssignment{
+					Levels: defaultOneLevel,
+					Domains: []tas.TopologyDomainAssignment{
+						{Count: 1, Values: []string{"y1"}},
+						{Count: 1, Values: []string{"y2"}},
+						{Count: 1, Values: []string{"y3"}},
+					},
+				},
+				wantDomainFailover: &DomainFailover{Level: tasRackLabel, From: "", To: "r2", MinCount: 2, HealthyCount: 0},
+			}},
+		},
+		"domain failover: a PodSet without the opt-in annotation waits for its repair": {
+			featureGates: domainFailoverGates,
+			nodes:        domainFailoverNodes(true, 3, 3),
+			pods:         []corev1.Pod{*domainFailoverFillerPod("x3")},
+			levels:       []string{tasRackLabel, corev1.LabelHostname},
+			workload:     domainFailoverWorkload(false, "x1", "x2"),
+			podSets: []PodSetTestCase{{
+				podSetName:      "main",
+				topologyRequest: &kueue.PodSetTopologyRequest{Required: new(string(tasRackLabel))},
+				requests:        map[corev1.ResourceName]int64{"example.com/gpu": 1},
+				count:           3,
+				minCount:        new(int32(2)),
+				wantReason:      `topology "default" doesn't allow to fit any of 1 pod(s). Total nodes: 7; excluded: resource "example.com/gpu": 1, topologyDomain: 6`,
+			}},
+		},
 		"node replacement skipped for single-Pod-owned workload; gate on": {
 			featureGates: map[featuregate.Feature]bool{features.SkipReassignmentForPodOwnedWorkloads: true},
 			nodes: []corev1.Node{
@@ -12420,6 +12577,7 @@ func TestFindTopologyAssignments(t *testing.T) {
 					tasInput := TASPodSetRequests{
 						PodSet: &kueue.PodSet{
 							Name:            kueue.NewPodSetReference(ps.podSetName),
+							MinCount:        ps.minCount,
 							TopologyRequest: topologyRequest,
 							Template: corev1.PodTemplateSpec{
 								Spec: corev1.PodSpec{
@@ -12453,7 +12611,8 @@ func TestFindTopologyAssignments(t *testing.T) {
 					flavorTASRequests = append(flavorTASRequests, tasInput)
 
 					wantPodSetResult := tasPodSetAssignmentResult{
-						FailureReason: ps.wantReason,
+						FailureReason:  ps.wantReason,
+						DomainFailover: ps.wantDomainFailover,
 					}
 					if ps.wantAssignment != nil {
 						wantPodSetResult.TopologyAssignment = ps.wantAssignment

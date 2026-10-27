@@ -645,6 +645,36 @@ type tasPodSetAssignmentResult struct {
 	TopologyAssignment *utiltas.TopologyAssignment
 	FailureReason      string
 	Flavor             kueue.ResourceFlavorReference
+	// DomainFailover is set when the assignment places the PodSet in another
+	// topology domain than the one its members were running in.
+	DomainFailover *DomainFailover
+}
+
+// DomainFailover records a second-pass placement that left the topology
+// domain a PodSet's members were running in, because that domain could no
+// longer host the PodSet's minimum count.
+type DomainFailover struct {
+	// Level is the topology level the PodSet requires.
+	Level string
+	// From is the domain the members were running in. It is empty when no
+	// node of that domain remains in the topology.
+	From utiltas.TopologyDomainID
+	// To is the domain the PodSet is now assigned to.
+	To utiltas.TopologyDomainID
+	// MinCount is the fewest pods the PodSet can run with.
+	MinCount int32
+	// HealthyCount is how many pods From could still run: its members on
+	// healthy nodes plus its free capacity.
+	HealthyCount int32
+}
+
+// Message describes the failover of the given PodSet for an event.
+func (f *DomainFailover) Message(podSet kueue.PodSetReference) string {
+	if f.From == "" {
+		return fmt.Sprintf("PodSet %s moved to %s %q: no node of its previous topology domain remains", podSet, f.Level, f.To)
+	}
+	return fmt.Sprintf("PodSet %s moved from %s %q to %q: %q can run %d of the %d pods the PodSet needs at minimum",
+		podSet, f.Level, f.From, f.To, f.From, f.HealthyCount, f.MinCount)
 }
 
 type FlavorTASRequests []TASPodSetRequests
@@ -927,11 +957,15 @@ func (s *TASFlavorSnapshot) FindTopologyAssignmentsForFlavor(ctx context.Context
 				// We deepCopy the existing TopologyAssignment, so if we delete unwanted domain,
 				// And there is no fit, we have the original newAssignment to retry with
 				existingAssignment := psa.TopologyAssignment
-				newAssignment, replacementAssignment, reason := s.findReplacementAssignment(ctx, &tr, utiltas.InternalFrom(existingAssignment), opts.workload, assumedUsage)
-				result[tr.PodSet.Name] = tasPodSetAssignmentResult{TopologyAssignment: newAssignment, FailureReason: reason}
-				if reason != "" {
+				newAssignment, replacementAssignment, failover, reason := s.findReplacementAssignment(ctx, &tr, utiltas.InternalFrom(existingAssignment), opts.workload, assumedUsage)
+				result[tr.PodSet.Name] = tasPodSetAssignmentResult{TopologyAssignment: newAssignment, FailureReason: reason, DomainFailover: failover}
+				switch {
+				case reason != "":
 					return result
-				} else {
+				case failover != nil:
+					log.V(2).Info("Moved the PodSet to another topology domain", "podSet", tr.PodSet.Name, "level", failover.Level, "from", failover.From, "to", failover.To,
+						"minCount", failover.MinCount, "healthyCount", failover.HealthyCount, "existingAssignment", existingAssignment, "newAssignment", newAssignment)
+				default:
 					log.V(3).Info("Found replacement assignment for workload", "existingAssignment", existingAssignment, "newAssignment", newAssignment)
 				}
 				s.addAssumedUsage(assumedUsage, replacementAssignment, &tr)
@@ -998,7 +1032,9 @@ func findLeaderAndWorkers(trs FlavorTASRequests) (*TASPodSetRequests, TASPodSetR
 
 // findReplacementAssignment finds the topology assignment for the replacement node
 // it return new corrected topologyAssignment, a replacement topologyAssignment used to patched the old, faulty one, and
-// reason if finding fails.
+// reason if finding fails. When the PodSet is moved to another topology domain
+// instead (see domainFailover), both assignments are the PodSet's new one and
+// the move is described by the returned DomainFailover.
 // It is only reachable for workloads with hostname-level assignments, as
 // UnhealthyNodes is populated behind an IsLowestLevelHostname gate; the
 // assignment values here and in its helpers are therefore node-scoped even
@@ -1009,21 +1045,27 @@ func (s *TASFlavorSnapshot) findReplacementAssignment(
 	existingAssignment *utiltas.TopologyAssignment,
 	wl *workload.Info,
 	assumedUsage *assumedUsage,
-) (*utiltas.TopologyAssignment, *utiltas.TopologyAssignment, string) {
+) (*utiltas.TopologyAssignment, *utiltas.TopologyAssignment, *DomainFailover, string) {
 	headNodeName := workload.FirstUnhealthyNodeName(wl.Obj)
+	admittedCount := tr.Count
 	tr.Count = deleteDomain(existingAssignment, headNodeName)
 	ignoreNodes := s.replacementIgnoreNodes(wl.Obj, existingAssignment)
 	if isStale, staleDomain := s.isTopologyAssignmentStaleIgnoringNodes(existingAssignment, ignoreNodes); isStale {
-		return nil, nil, fmt.Sprintf("Cannot replace the node, because the existing topologyAssignment is invalid, as it contains the stale domain %v", staleDomain)
+		return nil, nil, nil, fmt.Sprintf("Cannot replace the node, because the existing topologyAssignment is invalid, as it contains the stale domain %v", staleDomain)
 	}
 	requiredReplacementDomain := s.requiredReplacementDomain(tr, existingAssignment)
 	if isRequired(tr.PodSet.TopologyRequest) && len(existingAssignment.Domains) > 0 && requiredReplacementDomain == "" {
-		return nil, nil, "cannot replace the node: required topology domain of the remaining assignment cannot be determined"
+		if s.domainFailoverEnabled(tr, wl) {
+			// Every node the assignment still names is gone or queued for
+			// replacement, so the domain cannot run a single member.
+			return s.domainFailover(ctx, tr, admittedCount, "", 0, wl, assumedUsage)
+		}
+		return nil, nil, nil, "cannot replace the node: required topology domain of the remaining assignment cannot be determined"
 	}
 	trCopy := *tr
 	sliceSize, reason := getSliceSizeWithSinglePodAsDefault(tr.PodSet.TopologyRequest)
 	if reason != "" {
-		return nil, nil, reason
+		return nil, nil, nil, reason
 	}
 	if slicesRequested(tr.PodSet.TopologyRequest) && requiredReplacementDomain != "" && (tr.Count%sliceSize != 0) {
 		trCopy.PodSet = tr.PodSet.DeepCopy()
@@ -1049,10 +1091,19 @@ func (s *TASFlavorSnapshot) findReplacementAssignment(
 	// counts are passed and a domain over its spreading limit isn't excluded.
 	replacementAssignment, _, reason := s.findTopologyAssignment(ctx, trCopy, nil, assumedUsage, false, requiredReplacementDomain, wl, nil)
 	if reason != "" {
-		return nil, nil, reason
+		if requiredReplacementDomain != "" && s.domainFailoverEnabled(tr, wl) {
+			healthyCount, found, capacityReason := s.healthyCapacityInDomain(ctx, trCopy, existingAssignment, requiredReplacementDomain, wl, assumedUsage)
+			if capacityReason != "" {
+				return nil, nil, nil, capacityReason
+			}
+			if found && healthyCount < podSetMinCount(tr.PodSet, admittedCount) {
+				return s.domainFailover(ctx, tr, admittedCount, requiredReplacementDomain, healthyCount, wl, assumedUsage)
+			}
+		}
+		return nil, nil, nil, reason
 	}
 	if replacementAssignment == nil || len(replacementAssignment[tr.PodSet.Name].Domains) == 0 {
-		return nil, nil, fmt.Sprintf("cannot find replacement assignment for unhealthy node: %v", headNodeName)
+		return nil, nil, nil, fmt.Sprintf("cannot find replacement assignment for unhealthy node: %v", headNodeName)
 	}
 	newAssignment := s.mergeTopologyAssignments(replacementAssignment[tr.PodSet.Name], existingAssignment)
 	// Merging orders the domains by their level values, which may leave the
@@ -1062,9 +1113,106 @@ func (s *TASFlavorSnapshot) findReplacementAssignment(
 		// The repair could not keep the slices whole, which the rank-based
 		// ungating relies on. Reject it and let the workload be rescheduled
 		// from scratch instead of publishing a misaligned assignment.
-		return nil, nil, fmt.Sprintf("cannot replace the node %v without splitting a PodSet slice", wl.Obj.Status.UnhealthyNodes[0].Name)
+		return nil, nil, nil, fmt.Sprintf("cannot replace the node %v without splitting a PodSet slice", wl.Obj.Status.UnhealthyNodes[0].Name)
 	}
-	return newAssignment, replacementAssignment[tr.PodSet.Name], ""
+	return newAssignment, replacementAssignment[tr.PodSet.Name], nil, ""
+}
+
+// domainFailoverEnabled reports whether tr's PodSet may leave the topology
+// domain its members run in when that domain cannot reach the PodSet's minimum.
+func (s *TASFlavorSnapshot) domainFailoverEnabled(tr *TASPodSetRequests, wl *workload.Info) bool {
+	return wl != nil && workload.DomainFailoverEnabled(wl.Obj) && isRequired(tr.PodSet.TopologyRequest)
+}
+
+// podSetMinCount is the fewest pods the PodSet can run with: its MinCount, or
+// the admitted count for a PodSet that cannot be partially admitted.
+func podSetMinCount(ps *kueue.PodSet, admittedCount int32) int32 {
+	if ps.MinCount != nil {
+		return *ps.MinCount
+	}
+	return admittedCount
+}
+
+// healthyCapacityInDomain is how many of the PodSet's pods the domain can still
+// run: the members whose nodes are neither replaced nor queued for replacement,
+// plus the pods its free capacity takes, counted the way the failed replacement
+// counted them. found is false when the domain is not at the PodSet's required
+// level, which happens for a slice-level repair.
+func (s *TASFlavorSnapshot) healthyCapacityInDomain(
+	ctx context.Context,
+	tr TASPodSetRequests,
+	remainingAssignment *utiltas.TopologyAssignment,
+	domainID utiltas.TopologyDomainID,
+	wl *workload.Info,
+	assumedUsage *assumedUsage,
+) (healthyCount int32, found bool, reason string) {
+	levelIdx, ok := s.requiredLevelIdx(&tr)
+	if !ok {
+		return 0, false, ""
+	}
+	dom, ok := s.domainsPerLevel[levelIdx][domainID]
+	if !ok {
+		return 0, false, ""
+	}
+	unhealthyNodes := sets.New(workload.UnhealthyNodeNames(wl.Obj)...)
+	for _, assigned := range remainingAssignment.Domains {
+		if !unhealthyNodes.Has(assigned.Values[len(assigned.Values)-1]) {
+			healthyCount += assigned.Count
+		}
+	}
+	// The failed replacement computed this capacity but does not expose it.
+	if _, reason := s.prepareTopologyAssignmentState(ctx, tr, nil, assumedUsage, false, domainID, wl, nil); reason != "" {
+		return 0, true, reason
+	}
+	return healthyCount + s.domainStateOf(dom).podCount, true, ""
+}
+
+// requiredLevelIdx is the index of the topology level the PodSet requires.
+func (s *TASFlavorSnapshot) requiredLevelIdx(tr *TASPodSetRequests) (int, bool) {
+	key := s.levelKeyWithImpliedFallback(tr)
+	if key == nil {
+		return 0, false
+	}
+	return s.resolveLevelIdx(*key)
+}
+
+// domainFailover places the whole PodSet afresh, at its admitted count, in a
+// topology domain that fits it. The domain the members ran in cannot be chosen:
+// it holds fewer free pods than the PodSet's minimum and its own members still
+// occupy their nodes in the snapshot. As with node replacement, the PodSet is
+// not re-spread.
+func (s *TASFlavorSnapshot) domainFailover(
+	ctx context.Context,
+	tr *TASPodSetRequests,
+	admittedCount int32,
+	from utiltas.TopologyDomainID,
+	healthyCount int32,
+	wl *workload.Info,
+	assumedUsage *assumedUsage,
+) (*utiltas.TopologyAssignment, *utiltas.TopologyAssignment, *DomainFailover, string) {
+	minCount := podSetMinCount(tr.PodSet, admittedCount)
+	full := *tr
+	full.Count = admittedCount
+	full.PreviousAssignment = nil
+	assignments, _, reason := s.findTopologyAssignment(ctx, full, nil, assumedUsage, false, "", wl, nil)
+	if reason != "" {
+		if from == "" {
+			return nil, nil, nil, fmt.Sprintf("cannot replace the node: no node of the required topology domain of PodSet %s remains, and no other domain fits its %d pods: %s",
+				tr.PodSet.Name, admittedCount, reason)
+		}
+		return nil, nil, nil, fmt.Sprintf("cannot replace the node in topology domain %q, which can run %d of the %d pods PodSet %s needs at minimum, and no other domain fits its %d pods: %s",
+			from, healthyCount, minCount, tr.PodSet.Name, admittedCount, reason)
+	}
+	moved := assignments[tr.PodSet.Name]
+	levelIdx, _ := s.requiredLevelIdx(tr)
+	failover := &DomainFailover{
+		Level:        s.levelKeys[levelIdx],
+		From:         from,
+		To:           s.requiredReplacementDomain(&full, moved),
+		MinCount:     minCount,
+		HealthyCount: healthyCount,
+	}
+	return moved, moved, failover, ""
 }
 
 func (s *TASFlavorSnapshot) replacementIgnoreNodes(
@@ -1370,6 +1518,137 @@ func (s *TASFlavorSnapshot) findIncompleteSliceDomain(ta *utiltas.TopologyAssign
 	return ""
 }
 
+// prepareTopologyAssignmentState builds the placement state of a request and
+// fills in how many of its pods and slices fit in each topology domain, phase 1
+// of findTopologyAssignment. The counts stay in the snapshot's domain states
+// until the next request is prepared.
+func (s *TASFlavorSnapshot) prepareTopologyAssignmentState(
+	ctx context.Context,
+	workersTasPodSetRequests TASPodSetRequests,
+	leaderTasPodSetRequests *TASPodSetRequests,
+	assumedUsage *assumedUsage,
+	simulateEmpty bool,
+	requiredReplacementDomain utiltas.TopologyDomainID,
+	wl *workload.Info,
+	podSetGroupCounts *SpreadTreeCount,
+) (*findTopologyAssignmentState, string) {
+	requirements := &topologyAssignmentPodRequirements{
+		podRequirements:           simulator.PodRequirements{SimulateEmpty: simulateEmpty},
+		assumedUsage:              assumedUsage,
+		requiredReplacementDomain: requiredReplacementDomain,
+	}
+	state := &findTopologyAssignmentState{
+		count: workersTasPodSetRequests.Count,
+		stats: &tasExclusionStats{},
+	}
+	requirements.podRequests = newPodRequests(workersTasPodSetRequests)
+
+	if leaderTasPodSetRequests != nil {
+		requirements.leader = &leaderRequirements{podRequests: newPodRequests(*leaderTasPodSetRequests)}
+		// PodSet grouping validation requires the leader PodSet to have one replica.
+		state.leaderCount = 1
+	}
+
+	info, reason := podSetInfo(workersTasPodSetRequests)
+	if reason != "" {
+		return nil, reason
+	}
+
+	// If slice topology is not requested then we can assume that slice is a single pod
+	sliceSize, reason := getSliceSizeWithSinglePodAsDefault(workersTasPodSetRequests.PodSet.TopologyRequest)
+	if len(reason) > 0 {
+		return nil, reason
+	}
+	shape := newSliceShape(workersTasPodSetRequests.PodSet.TopologyRequest, state.count, sliceSize)
+	state.sliceSize = shape.size
+	state.tailSize = shape.tailSize
+
+	state.required = isRequired(workersTasPodSetRequests.PodSet.TopologyRequest)
+	state.unconstrained = isUnconstrained(workersTasPodSetRequests.PodSet.TopologyRequest, &workersTasPodSetRequests)
+
+	topologyKey := s.levelKeyWithImpliedFallback(&workersTasPodSetRequests)
+	if topologyKey == nil {
+		return nil, "topology level not specified"
+	}
+	requestedLevelIdx, found := s.resolveLevelIdx(*topologyKey)
+	if !found {
+		return nil, fmt.Sprintf("no requested topology level: %s", *topologyKey)
+	}
+	state.requestedLevelIdx = requestedLevelIdx
+
+	sliceTopologyKey := s.sliceLevelKeyWithDefault(workersTasPodSetRequests.PodSet.TopologyRequest, s.explicitLowestLevel())
+	sliceLevelIdx, found := s.resolveLevelIdx(sliceTopologyKey)
+	if !found {
+		return nil, fmt.Sprintf("no requested topology level for slices: %s", sliceTopologyKey)
+	}
+	state.sliceLevelIdx = sliceLevelIdx
+
+	if state.requestedLevelIdx > state.sliceLevelIdx {
+		return nil, fmt.Sprintf("podset slice topology %s is above the podset topology %s", sliceTopologyKey, *topologyKey)
+	}
+
+	// Spreading only applies when the feature gate is on and counts were
+	// supplied for the group (the node replacement path never supplies them).
+	// Gated here, covering the whole block, so a flavor is never rejected by
+	// validateSpreadingLevels while the rules themselves go unenforced.
+	if features.Enabled(features.TASTopologySpreading) && podSetGroupCounts != nil && state.required {
+		spec := wl.TopologySpreading[utiltas.GroupKeyForPodSet(workersTasPodSetRequests.PodSet)]
+		if reason := s.validateSpreadingLevels(spec, state.requestedLevelIdx); len(reason) > 0 {
+			return nil, reason
+		}
+		state.spreadRules = s.resolveSpreadLevelRules(spec)
+		state.spreadCounts = podSetGroupCounts
+	}
+
+	sliceSizeAtLevel, reason := s.buildSliceSizeAtLevel(workersTasPodSetRequests, state.sliceSize, state.sliceLevelIdx)
+	if len(reason) > 0 {
+		return nil, reason
+	}
+	state.sliceSizeAtLevel = sliceSizeAtLevel
+
+	if len(sliceSizeAtLevel) > 0 {
+		state.multiLayerConstraints = utiltas.PodSetSliceRequiredTopologyConstraints(workersTasPodSetRequests.PodSet.TopologyRequest)
+	}
+
+	podRequirements, reason := s.buildPodRequirements(info, workersTasPodSetRequests.PodSet, workloadNamespace(wl))
+	if reason != "" {
+		return nil, reason
+	}
+	// buildPodRequirements only knows the PodSet, so the caller's question is carried
+	// over rather than overwritten.
+	podRequirements.SimulateEmpty = simulateEmpty
+	requirements.podRequirements = podRequirements
+	if s.leafIsNode() && features.Enabled(features.TASCacheNodeMatchResults) && wl != nil && wl.Obj.UID != "" {
+		requirements.matchKey = &podSetMatchKey{
+			WorkloadUID: wl.Obj.UID,
+			PodSetName:  string(workersTasPodSetRequests.PodSet.Name),
+			// The default simulator answers both the same way, so it keeps one
+			// entry for both.
+			EmptyCluster: simulateEmpty && features.Enabled(features.SchedulerLibraryIntegration),
+		}
+	}
+
+	if leaderTasPodSetRequests != nil && features.Enabled(features.TASLeaderPodSetFeasibility) {
+		leaderInfo, reason := podSetInfo(*leaderTasPodSetRequests)
+		if reason != "" {
+			return nil, reason
+		}
+		leaderPodRequirements, reason := s.buildPodRequirements(leaderInfo, leaderTasPodSetRequests.PodSet, workloadNamespace(wl))
+		if reason != "" {
+			return nil, reason
+		}
+		leaderPodRequirements.SimulateEmpty = simulateEmpty
+		requirements.leader.podRequirements = &leaderPodRequirements
+	}
+
+	// phase 1 - determine the number of pods and slices which can fit in each topology domain
+	err := s.fillInCounts(ctx, requirements, state)
+	if err != nil {
+		return nil, fmt.Sprintf("unable to calculate domain capacities for PodSet %s, error: %s", info.Name, err.Error())
+	}
+	return state, ""
+}
+
 // Algorithm overview:
 // Phase 1:
 //
@@ -1393,119 +1672,9 @@ func (s *TASFlavorSnapshot) findTopologyAssignment(
 	wl *workload.Info,
 	podSetGroupCounts *SpreadTreeCount,
 ) (assignments, leafAssignments map[kueue.PodSetReference]*utiltas.TopologyAssignment, reason string) {
-	requirements := &topologyAssignmentPodRequirements{
-		podRequirements:           simulator.PodRequirements{SimulateEmpty: simulateEmpty},
-		assumedUsage:              assumedUsage,
-		requiredReplacementDomain: requiredReplacementDomain,
-	}
-	state := &findTopologyAssignmentState{
-		count: workersTasPodSetRequests.Count,
-		stats: &tasExclusionStats{},
-	}
-	requirements.podRequests = newPodRequests(workersTasPodSetRequests)
-
-	if leaderTasPodSetRequests != nil {
-		requirements.leader = &leaderRequirements{podRequests: newPodRequests(*leaderTasPodSetRequests)}
-		// PodSet grouping validation requires the leader PodSet to have one replica.
-		state.leaderCount = 1
-	}
-
-	info, reason := podSetInfo(workersTasPodSetRequests)
+	state, reason := s.prepareTopologyAssignmentState(ctx, workersTasPodSetRequests, leaderTasPodSetRequests, assumedUsage, simulateEmpty, requiredReplacementDomain, wl, podSetGroupCounts)
 	if reason != "" {
 		return nil, nil, reason
-	}
-
-	// If slice topology is not requested then we can assume that slice is a single pod
-	sliceSize, reason := getSliceSizeWithSinglePodAsDefault(workersTasPodSetRequests.PodSet.TopologyRequest)
-	if len(reason) > 0 {
-		return nil, nil, reason
-	}
-	shape := newSliceShape(workersTasPodSetRequests.PodSet.TopologyRequest, state.count, sliceSize)
-	state.sliceSize = shape.size
-	state.tailSize = shape.tailSize
-
-	state.required = isRequired(workersTasPodSetRequests.PodSet.TopologyRequest)
-	state.unconstrained = isUnconstrained(workersTasPodSetRequests.PodSet.TopologyRequest, &workersTasPodSetRequests)
-
-	topologyKey := s.levelKeyWithImpliedFallback(&workersTasPodSetRequests)
-	if topologyKey == nil {
-		return nil, nil, "topology level not specified"
-	}
-	requestedLevelIdx, found := s.resolveLevelIdx(*topologyKey)
-	if !found {
-		return nil, nil, fmt.Sprintf("no requested topology level: %s", *topologyKey)
-	}
-	state.requestedLevelIdx = requestedLevelIdx
-
-	sliceTopologyKey := s.sliceLevelKeyWithDefault(workersTasPodSetRequests.PodSet.TopologyRequest, s.explicitLowestLevel())
-	sliceLevelIdx, found := s.resolveLevelIdx(sliceTopologyKey)
-	if !found {
-		return nil, nil, fmt.Sprintf("no requested topology level for slices: %s", sliceTopologyKey)
-	}
-	state.sliceLevelIdx = sliceLevelIdx
-
-	if state.requestedLevelIdx > state.sliceLevelIdx {
-		return nil, nil, fmt.Sprintf("podset slice topology %s is above the podset topology %s", sliceTopologyKey, *topologyKey)
-	}
-
-	// Spreading only applies when the feature gate is on and counts were
-	// supplied for the group (the node replacement path never supplies them).
-	// Gated here, covering the whole block, so a flavor is never rejected by
-	// validateSpreadingLevels while the rules themselves go unenforced.
-	if features.Enabled(features.TASTopologySpreading) && podSetGroupCounts != nil && state.required {
-		spec := wl.TopologySpreading[utiltas.GroupKeyForPodSet(workersTasPodSetRequests.PodSet)]
-		if reason := s.validateSpreadingLevels(spec, state.requestedLevelIdx); len(reason) > 0 {
-			return nil, nil, reason
-		}
-		state.spreadRules = s.resolveSpreadLevelRules(spec)
-		state.spreadCounts = podSetGroupCounts
-	}
-
-	sliceSizeAtLevel, reason := s.buildSliceSizeAtLevel(workersTasPodSetRequests, state.sliceSize, state.sliceLevelIdx)
-	if len(reason) > 0 {
-		return nil, nil, reason
-	}
-	state.sliceSizeAtLevel = sliceSizeAtLevel
-
-	if len(sliceSizeAtLevel) > 0 {
-		state.multiLayerConstraints = utiltas.PodSetSliceRequiredTopologyConstraints(workersTasPodSetRequests.PodSet.TopologyRequest)
-	}
-
-	podRequirements, reason := s.buildPodRequirements(info, workersTasPodSetRequests.PodSet, workloadNamespace(wl))
-	if reason != "" {
-		return nil, nil, reason
-	}
-	// buildPodRequirements only knows the PodSet, so the caller's question is carried
-	// over rather than overwritten.
-	podRequirements.SimulateEmpty = simulateEmpty
-	requirements.podRequirements = podRequirements
-	if s.leafIsNode() && features.Enabled(features.TASCacheNodeMatchResults) && wl != nil && wl.Obj.UID != "" {
-		requirements.matchKey = &podSetMatchKey{
-			WorkloadUID: wl.Obj.UID,
-			PodSetName:  string(workersTasPodSetRequests.PodSet.Name),
-			// The default simulator answers both the same way, so it keeps one
-			// entry for both.
-			EmptyCluster: simulateEmpty && features.Enabled(features.SchedulerLibraryIntegration),
-		}
-	}
-
-	if leaderTasPodSetRequests != nil && features.Enabled(features.TASLeaderPodSetFeasibility) {
-		leaderInfo, reason := podSetInfo(*leaderTasPodSetRequests)
-		if reason != "" {
-			return nil, nil, reason
-		}
-		leaderPodRequirements, reason := s.buildPodRequirements(leaderInfo, leaderTasPodSetRequests.PodSet, workloadNamespace(wl))
-		if reason != "" {
-			return nil, nil, reason
-		}
-		leaderPodRequirements.SimulateEmpty = simulateEmpty
-		requirements.leader.podRequirements = &leaderPodRequirements
-	}
-
-	// phase 1 - determine the number of pods and slices which can fit in each topology domain
-	err := s.fillInCounts(ctx, requirements, state)
-	if err != nil {
-		return nil, nil, fmt.Sprintf("unable to calculate domain capacities for PodSet %s, error: %s", info.Name, err.Error())
 	}
 
 	// phase 2a: determine the level at which the assignment is done along with
