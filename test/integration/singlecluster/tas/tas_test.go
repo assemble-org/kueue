@@ -2396,14 +2396,19 @@ var _ = ginkgo.Describe("Topology Aware Scheduling", func() {
 						}, behavioral.ConsistentDuration, behavioral.ShortInterval).Should(gomega.Succeed())
 					})
 
+					ginkgo.By("reporting the member of the failed node as reclaimable, which sizes the second pass below the admitted count", func() {
+						integration.UpdateReclaimablePods(ctx, k8sClient, wl, []kueue.ReclaimablePod{{Name: "r1", Count: 1}})
+					})
+
 					ginkgo.By("failing a second rack-rb node, which leaves the rack below the minimum", func() {
 						failNode("b2")
 					})
 
-					ginkgo.By("verifying r1 moved to rack rc, r0 kept its nodes and nothing is left to replace", func() {
+					ginkgo.By("verifying r1 moved to rack rc at its admitted count, r0 kept its nodes and nothing is left to replace", func() {
 						gomega.Eventually(func(g gomega.Gomega) {
 							g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), wl)).To(gomega.Succeed())
 							g.Expect(wl.Status.Admission.PodSetAssignments[0].TopologyAssignment).Should(gomega.BeComparableTo(hostnames("a1", "a2")))
+							g.Expect(wl.Status.Admission.PodSetAssignments[1].Count).To(gomega.Equal(new(int32(3))))
 							moved := utiltas.InternalFrom(wl.Status.Admission.PodSetAssignments[1].TopologyAssignment)
 							g.Expect(moved.Domains).To(gomega.HaveLen(3))
 							for _, domain := range moved.Domains {

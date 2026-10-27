@@ -1047,7 +1047,10 @@ func (s *TASFlavorSnapshot) findReplacementAssignment(
 	assumedUsage *assumedUsage,
 ) (*utiltas.TopologyAssignment, *utiltas.TopologyAssignment, *DomainFailover, string) {
 	headNodeName := workload.FirstUnhealthyNodeName(wl.Obj)
-	admittedCount := tr.Count
+	// The request count is net of reclaimable pods, while the admission's count
+	// cannot change; a PodSet moving to another domain is placed afresh at the
+	// count its assignment covers.
+	admittedCount := utiltas.CountPodsInAssignment(existingAssignment)
 	tr.Count = deleteDomain(existingAssignment, headNodeName)
 	ignoreNodes := s.replacementIgnoreNodes(wl.Obj, existingAssignment)
 	if isStale, staleDomain := s.isTopologyAssignmentStaleIgnoringNodes(existingAssignment, ignoreNodes); isStale {

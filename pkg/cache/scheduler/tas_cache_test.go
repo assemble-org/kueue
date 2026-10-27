@@ -668,6 +668,31 @@ func TestFindTopologyAssignments(t *testing.T) {
 				wantDomainFailover: &DomainFailover{Level: tasRackLabel, From: "r1", To: "r2", MinCount: 2, HealthyCount: 1},
 			}},
 		},
+		"domain failover: the PodSet moves at its admitted count when the request is net of reclaimable pods": {
+			// One member of the PodSet is reported reclaimable, so the second
+			// pass asks for 2 pods; the admission still covers 3.
+			featureGates: domainFailoverGates,
+			nodes:        domainFailoverNodes(true, 3, 3),
+			pods:         []corev1.Pod{*domainFailoverFillerPod("x3")},
+			levels:       []string{tasRackLabel, corev1.LabelHostname},
+			workload:     domainFailoverWorkload(true, "x1", "x2"),
+			podSets: []PodSetTestCase{{
+				podSetName:      "main",
+				topologyRequest: &kueue.PodSetTopologyRequest{Required: new(string(tasRackLabel))},
+				requests:        map[corev1.ResourceName]int64{"example.com/gpu": 1},
+				count:           2,
+				minCount:        new(int32(2)),
+				wantAssignment: &tas.TopologyAssignment{
+					Levels: defaultOneLevel,
+					Domains: []tas.TopologyDomainAssignment{
+						{Count: 1, Values: []string{"y1"}},
+						{Count: 1, Values: []string{"y2"}},
+						{Count: 1, Values: []string{"y3"}},
+					},
+				},
+				wantDomainFailover: &DomainFailover{Level: tasRackLabel, From: "r1", To: "r2", MinCount: 2, HealthyCount: 1},
+			}},
+		},
 		"domain failover: a domain that can still reach the minimum waits for its repair": {
 			featureGates: domainFailoverGates,
 			nodes:        domainFailoverNodes(true, 3, 3),

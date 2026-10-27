@@ -1013,6 +1013,9 @@ func (s *Scheduler) admit(ctx context.Context, e *entry, cq *schdcache.ClusterQu
 		ClusterQueue:      e.ClusterQueue,
 		PodSetAssignments: e.assignment.ToAPI(log),
 	}
+	if workload.NeedsSecondPass(e.Obj) {
+		keepAdmittedCounts(admission, e.Obj.Status.Admission)
+	}
 
 	consideredStr := flavorassigner.FormatFlavorAssignmentAttemptsForEvents(e.assignment)
 	cacheWl, err := s.assumeWorkload(ctx, log, e, cq, admission)
@@ -1078,6 +1081,25 @@ func (s *Scheduler) admit(ctx context.Context, e *entry, cq *schdcache.ClusterQu
 	})
 
 	return nil
+}
+
+// keepAdmittedCounts carries each PodSet's admitted count and resource usage
+// into a second-pass admission. The second pass sizes its request net of
+// reclaimable pods, while the Workload webhook lets only the topology
+// assignment change on an existing admission.
+func keepAdmittedCounts(admission, admitted *kueue.Admission) {
+	if admitted == nil {
+		return
+	}
+	for i := range admission.PodSetAssignments {
+		psa := &admission.PodSetAssignments[i]
+		idx := slices.IndexFunc(admitted.PodSetAssignments, func(a kueue.PodSetAssignment) bool { return a.Name == psa.Name })
+		if idx < 0 {
+			continue
+		}
+		psa.Count = admitted.PodSetAssignments[idx].Count
+		psa.ResourceUsage = admitted.PodSetAssignments[idx].ResourceUsage
+	}
 }
 
 func (s *Scheduler) patchWorkloadAdmission(
