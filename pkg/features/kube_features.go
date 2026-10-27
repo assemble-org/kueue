@@ -185,6 +185,14 @@ const (
 	// inside the domain the previous slice holds, and waits while that domain
 	// is stale or has unhealthy nodes. Requires ElasticJobsViaWorkloadSlicesWithTAS.
 	ElasticJobsViaWorkloadSlicesWithRequiredTopology featuregate.Feature = "ElasticJobsViaWorkloadSlicesWithRequiredTopology"
+	// ElasticJobsViaWorkloadSlicesDomainFailover lets an elastic workload slice
+	// with required topology leave the domain its members run in. When a node
+	// replacement cannot be placed in that domain and the domain can no longer
+	// host the PodSet's minimum count, the second pass places the whole PodSet
+	// in another domain that fits it; the members left behind are released by
+	// the job. Opted into per job with the elastic-job-domain-failover
+	// annotation. Requires ElasticJobsViaWorkloadSlicesWithRequiredTopology.
+	ElasticJobsViaWorkloadSlicesDomainFailover featuregate.Feature = "ElasticJobsViaWorkloadSlicesDomainFailover"
 
 	// owner: @sohankunkerkar
 	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/77-dynamically-sized-jobs
@@ -942,6 +950,7 @@ var defaultFeatureGateDependencies = map[featuregate.Feature][]featuregate.Featu
 	ElasticJobsViaWorkloadSlicesForProvisioningRequests: {ElasticJobsViaWorkloadSlices},
 	ElasticJobsViaWorkloadSlicesForPodGroups:            {ElasticJobsViaWorkloadSlices},
 	ElasticJobsViaWorkloadSlicesWithRequiredTopology:    {ElasticJobsViaWorkloadSlicesWithTAS},
+	ElasticJobsViaWorkloadSlicesDomainFailover:          {ElasticJobsViaWorkloadSlicesWithRequiredTopology},
 	SchedulerLibraryIntegration:                         {TopologyAwareScheduling},
 	SchedulerLibraryDeepIntegration:                     {SchedulerLibraryIntegration},
 }
@@ -1029,6 +1038,9 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
 		{Version: version.MustParse("0.21"), Default: false, PreRelease: featuregate.Alpha},
 	},
 	ElasticJobsViaWorkloadSlicesWithRequiredTopology: {
+		{Version: version.MustParse("0.21"), Default: false, PreRelease: featuregate.Alpha},
+	},
+	ElasticJobsViaWorkloadSlicesDomainFailover: {
 		{Version: version.MustParse("0.21"), Default: false, PreRelease: featuregate.Alpha},
 	},
 	ElasticJobsViaWorkloadSlicesWithTAS: {

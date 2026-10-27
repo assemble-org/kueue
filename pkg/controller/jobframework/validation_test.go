@@ -507,6 +507,7 @@ func TestValidateJobOnUpdate(t *testing.T) {
 func TestValidateJobOnCreate(t *testing.T) {
 	elasticAnnotationPath := field.NewPath("metadata", "annotations").Key(workloadslicing.EnabledAnnotationKey)
 	scaleUpStrategyPath := field.NewPath("metadata", "annotations").Key(kueueconstants.ElasticJobScaleUpStrategyAnnotationKey)
+	domainFailoverPath := field.NewPath("metadata", "annotations").Key(kueueconstants.ElasticJobDomainFailoverAnnotationKey)
 	testCases := map[string]struct {
 		job          *batchv1.Job
 		gvk          schema.GroupVersionKind
@@ -543,6 +544,51 @@ func TestValidateJobOnCreate(t *testing.T) {
 				Obj(),
 			gvk:          schema.GroupVersionKind{Group: "jobset.x-k8s.io", Version: "v1alpha2", Kind: "JobSet"},
 			featureGates: map[featuregate.Feature]bool{features.ElasticJobsViaWorkloadSlices: false},
+		},
+		"domain failover is allowed with elastic job and feature gate": {
+			job: utiltestingjob.MakeJob("test-job", "ns1").
+				SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
+				SetAnnotation(kueueconstants.ElasticJobDomainFailoverAnnotationKey, kueueconstants.ElasticJobDomainFailoverAnnotationValue).
+				Obj(),
+			gvk: batchv1.SchemeGroupVersion.WithKind("Job"),
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlicesDomainFailover: true,
+			},
+		},
+		"domain failover without elastic job is rejected": {
+			job: utiltestingjob.MakeJob("test-job", "ns1").
+				SetAnnotation(kueueconstants.ElasticJobDomainFailoverAnnotationKey, kueueconstants.ElasticJobDomainFailoverAnnotationValue).
+				Obj(),
+			gvk: batchv1.SchemeGroupVersion.WithKind("Job"),
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlicesDomainFailover: true,
+			},
+			wantErr: field.ErrorList{
+				field.Forbidden(domainFailoverPath, ""),
+			},
+		},
+		"domain failover with an unsupported value is rejected": {
+			job: utiltestingjob.MakeJob("test-job", "ns1").
+				SetAnnotation(workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue).
+				SetAnnotation(kueueconstants.ElasticJobDomainFailoverAnnotationKey, "yes").
+				Obj(),
+			gvk: batchv1.SchemeGroupVersion.WithKind("Job"),
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlicesDomainFailover: true,
+			},
+			wantErr: field.ErrorList{
+				field.NotSupported(domainFailoverPath, "yes", []string{kueueconstants.ElasticJobDomainFailoverAnnotationValue}),
+			},
+		},
+		"domain failover is ignored when the feature gate is disabled": {
+			job: utiltestingjob.MakeJob("test-job", "ns1").
+				SetAnnotation(kueueconstants.ElasticJobDomainFailoverAnnotationKey, "yes").
+				Obj(),
+			gvk: batchv1.SchemeGroupVersion.WithKind("Job"),
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlices:               true,
+				features.ElasticJobsViaWorkloadSlicesDomainFailover: false,
+			},
 		},
 		"scale-up strategy atomic is allowed with elastic job and feature gate": {
 			job: utiltestingjob.MakeJob("test-job", "ns1").

@@ -9853,6 +9853,21 @@ func TestIsPodRunnableOrSucceeded(t *testing.T) {
 			// group can still be declared finished once every pod has concluded.
 			want: true,
 		},
+		"deleting, terminated Succeeded with a NodeName, deleted as a member stranded by a domain failover": {
+			pod: corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: new(metav1.NewTime(now))},
+				Spec:       corev1.PodSpec{NodeName: "node-1"},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodSucceeded,
+					Conditions: []corev1.PodCondition{{
+						Type:   corev1.PodConditionType(ConditionTypeTerminationTarget),
+						Status: corev1.ConditionTrue,
+						Reason: ReasonTopologyDomainFailover,
+					}},
+				},
+			},
+			want: false,
+		},
 		"deleting, terminated Succeeded but kept its NodeName, serving group": {
 			pod: corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{

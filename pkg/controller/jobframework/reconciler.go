@@ -2079,6 +2079,11 @@ func prepareWorkloadSlice(ctx context.Context, clnt client.Client, job GenericJo
 	// associated Job object. This is particularly useful in contexts such as the
 	// MultiKueue workload controller, where the Job may not be immediately available.
 	metav1.SetMetaDataAnnotation(&wl.ObjectMeta, workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue)
+	// The scheduler reads the domain-failover opt-in off the Workload, so it travels with every slice.
+	if features.Enabled(features.ElasticJobsViaWorkloadSlicesDomainFailover) &&
+		job.Object().GetAnnotations()[constants.ElasticJobDomainFailoverAnnotationKey] == constants.ElasticJobDomainFailoverAnnotationValue {
+		metav1.SetMetaDataAnnotation(&wl.ObjectMeta, constants.ElasticJobDomainFailoverAnnotationKey, constants.ElasticJobDomainFailoverAnnotationValue)
+	}
 
 	// Lookup existing slice for a given job.
 	workloadSlices, err := findNotFinishedWorkloadSlices(ctx, clnt, job)

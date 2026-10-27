@@ -42,8 +42,10 @@ import (
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/podset"
 	"sigs.k8s.io/kueue/pkg/util/expectations"
+	"sigs.k8s.io/kueue/pkg/util/tas"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
+	testingnode "sigs.k8s.io/kueue/pkg/util/testingjobs/node"
 	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
 	"sigs.k8s.io/kueue/pkg/workloadslicing"
 )
@@ -673,5 +675,234 @@ func TestCleanupMembersElasticGroup(t *testing.T) {
 				t.Errorf("absentPods = %d, want %d", group.absentPods, tc.wantAbsent)
 			}
 		})
+	}
+}
+
+func TestCleanupMembersStrandedByDomainFailover(t *testing.T) {
+	const rackLabel = "cloud.com/topology-rack"
+	now := time.Now().Truncate(time.Second)
+	gates := map[featuregate.Feature]bool{
+		features.ElasticJobsViaWorkloadSlicesForPodGroups:   true,
+		features.ElasticJobsViaWorkloadSlicesDomainFailover: true,
+	}
+	// The role is assigned to rack r2 (y1, y2, y3) after a failover away from
+	// rack r1 (x1).
+	slice := func(optIn bool) *kueue.Workload {
+		wl := utiltestingapi.MakeWorkload(elasticTestGroup, elasticTestNamespace).Group().
+			Annotation(kueueconstants.ElasticJobAnnotation, "true").
+			PodSets(*utiltestingapi.MakePodSet(kueue.NewPodSetReference(elasticTestRoleHash), 3).
+				RequiredTopologyRequest(rackLabel).Obj()).
+			Admission(utiltestingapi.MakeAdmission("cq", kueue.NewPodSetReference(elasticTestRoleHash)).
+				PodSets(utiltestingapi.MakePodSetAssignment(kueue.NewPodSetReference(elasticTestRoleHash)).
+					Count(3).
+					TopologyAssignment(utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname}).
+						Domain(tas.TopologyDomainAssignment{Count: 1, Values: []string{"y1"}}).
+						Domain(tas.TopologyDomainAssignment{Count: 1, Values: []string{"y2"}}).
+						Domain(tas.TopologyDomainAssignment{Count: 1, Values: []string{"y3"}}).
+						Obj()).
+					Obj()).
+				Obj())
+		if optIn {
+			wl.Annotation(kueueconstants.ElasticJobDomainFailoverAnnotationKey, kueueconstants.ElasticJobDomainFailoverAnnotationValue)
+		}
+		return wl.Obj()
+	}
+	node := func(name, rack string) *corev1.Node {
+		return testingnode.MakeNode(name).Label(rackLabel, rack).Label(corev1.LabelHostname, name).Obj()
+	}
+	nodes := []client.Object{node("x1", "r1"), node("y1", "r2"), node("y2", "r2"), node("y3", "r2")}
+	// The webhook stamps the role hash before the ungater adds a node selector,
+	// so a scheduled member carries it as an annotation.
+	runningOn := func(name, nodeName string) *corev1.Pod {
+		return elasticGroupMember(name).UID(name).KueueFinalizer().RoleHash(elasticTestRoleHash).
+			CreationTimestamp(now.Add(-time.Hour)).NodeName(nodeName).
+			NodeSelector(corev1.LabelHostname, nodeName).StatusPhase(corev1.PodRunning).Obj()
+	}
+	gated := func(name string) *corev1.Pod {
+		return elasticGroupMember(name).UID(name).KueueFinalizer().RoleHash(elasticTestRoleHash).
+			CreationTimestamp(now.Add(-time.Minute)).TopologySchedulingGate().StatusPhase(corev1.PodPending).Obj()
+	}
+	testCases := map[string]struct {
+		workload   *kueue.Workload
+		nodes      []client.Object
+		pods       []*corev1.Pod
+		pendingOps bool
+		// reconcileAgain runs a second CleanupMembers with the expectations the
+		// first one recorded, once the deleted member has terminated and its
+		// replacement exists, as the next reconcile of the group finds them.
+		reconcileAgain bool
+		wantErr        error
+		wantStranded   []string
+		// wantFinalized are the pods the second reconcile released.
+		wantFinalized []string
+	}{
+		"the member left in the previous rack is deleted; the member in the new rack and the gated member stay": {
+			workload:     slice(true),
+			nodes:        nodes,
+			pods:         []*corev1.Pod{runningOn("grp-0", "x1"), runningOn("grp-1", "y1"), gated("grp-2")},
+			wantStranded: []string{"grp-0"},
+		},
+		"a deleted stranded member does not hold up the next reconcile, which releases it to its replacement": {
+			workload:       slice(true),
+			nodes:          nodes,
+			pods:           []*corev1.Pod{runningOn("grp-0", "x1"), runningOn("grp-1", "y1"), gated("grp-2")},
+			reconcileAgain: true,
+			wantStranded:   []string{"grp-0"},
+			wantFinalized:  []string{"grp-0"},
+		},
+		"a member already terminating is left alone": {
+			workload: slice(true),
+			nodes:    nodes,
+			pods: []*corev1.Pod{
+				elasticGroupMember("grp-0").UID("grp-0").KueueFinalizer().RoleHash(elasticTestRoleHash).CreationTimestamp(now.Add(-time.Hour)).
+					NodeName("x1").StatusPhase(corev1.PodRunning).DeletionTimestamp(now).Obj(),
+				runningOn("grp-1", "y1"), gated("grp-2"),
+			},
+		},
+		"a member whose node is gone is left to end with it": {
+			workload: slice(true),
+			nodes:    nodes[1:],
+			pods:     []*corev1.Pod{runningOn("grp-0", "x1"), runningOn("grp-1", "y1"), gated("grp-2")},
+		},
+		"without the opt-in annotation nothing is deleted": {
+			workload: slice(false),
+			nodes:    nodes,
+			pods:     []*corev1.Pod{runningOn("grp-0", "x1"), runningOn("grp-1", "y1"), gated("grp-2")},
+		},
+		"nothing is deleted before earlier operations on pods are observed": {
+			workload:   slice(true),
+			nodes:      nodes,
+			pods:       []*corev1.Pod{runningOn("grp-0", "x1"), runningOn("grp-1", "y1"), gated("grp-2")},
+			pendingOps: true,
+			wantErr:    errPendingOps,
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			features.SetFeatureGatesDuringTest(t, gates)
+			ctx, log := utiltesting.ContextWithLog(t)
+			objects := slices.Clone(tc.nodes)
+			for _, pod := range tc.pods {
+				objects = append(objects, pod.DeepCopy())
+			}
+			cli := utiltesting.NewClientBuilder().WithObjects(objects...).Build()
+			key := types.NamespacedName{Namespace: elasticTestNamespace, Name: elasticTestGroup}
+			store := expectations.NewStore("test")
+
+			group := elasticGroup(tc.pods...)
+			group.key = key
+			group.excessPodExpectations = store
+			group.satisfiedExcessPods = !tc.pendingOps
+			group.clock = realClock
+			recorder := &utiltesting.EventRecorder{}
+
+			err := group.CleanupMembers(ctx, cli, recorder, tc.workload)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("CleanupMembers() error = %v, want %v", err, tc.wantErr)
+			}
+			if tc.reconcileAgain {
+				// The deleted member ends its container with exit code 0 and its
+				// replacement arrives before the group is reconciled again.
+				for _, name := range tc.wantStranded {
+					var deleted corev1.Pod
+					if err := cli.Get(ctx, client.ObjectKey{Namespace: elasticTestNamespace, Name: name}, &deleted); err != nil {
+						t.Fatalf("pod %s: get error %v", name, err)
+					}
+					deleted.Status.Phase = corev1.PodSucceeded
+					if err := cli.Status().Update(ctx, &deleted); err != nil {
+						t.Fatalf("pod %s: status update error %v", name, err)
+					}
+					if err := cli.Create(ctx, gated(name+"-r")); err != nil {
+						t.Fatalf("pod %s-r: create error %v", name, err)
+					}
+				}
+				var podList corev1.PodList
+				if err := cli.List(ctx, &podList, client.InNamespace(elasticTestNamespace)); err != nil {
+					t.Fatalf("listing pods: %v", err)
+				}
+				members := make([]*corev1.Pod, len(podList.Items))
+				for i := range podList.Items {
+					members[i] = &podList.Items[i]
+				}
+				again := elasticGroup(members...)
+				again.key = key
+				again.excessPodExpectations = store
+				again.satisfiedExcessPods = store.Satisfied(log, key)
+				again.clock = realClock
+				if err := again.CleanupMembers(ctx, cli, recorder, tc.workload); err != nil {
+					t.Fatalf("second CleanupMembers() error = %v, want nil", err)
+				}
+			}
+			var gotStranded []string
+			for _, pod := range tc.pods {
+				var got corev1.Pod
+				err := cli.Get(ctx, client.ObjectKeyFromObject(pod), &got)
+				if slices.Contains(tc.wantFinalized, pod.Name) {
+					if err == nil && slices.Contains(got.Finalizers, podconstants.PodFinalizer) {
+						t.Errorf("pod %s: finalizer kept, want it released to the replacement", pod.Name)
+					}
+					if client.IgnoreNotFound(err) != nil {
+						t.Fatalf("pod %s: get error %v", pod.Name, err)
+					}
+					gotStranded = append(gotStranded, pod.Name)
+					continue
+				}
+				if err != nil {
+					t.Fatalf("pod %s: get error %v, want it kept until replaced", pod.Name, err)
+				}
+				if !slices.Contains(got.Finalizers, podconstants.PodFinalizer) {
+					t.Errorf("pod %s: finalizer removed, want it kept", pod.Name)
+				}
+				if !got.DeletionTimestamp.IsZero() && pod.DeletionTimestamp.IsZero() {
+					terminationTarget := slices.IndexFunc(got.Status.Conditions, func(c corev1.PodCondition) bool {
+						return c.Type == corev1.PodConditionType(ConditionTypeTerminationTarget)
+					})
+					if terminationTarget < 0 {
+						t.Errorf("pod %s: deleted without a termination condition", pod.Name)
+					} else if reason := got.Status.Conditions[terminationTarget].Reason; reason != ReasonTopologyDomainFailover {
+						t.Errorf("pod %s: termination reason = %q, want %q", pod.Name, reason, ReasonTopologyDomainFailover)
+					}
+					gotStranded = append(gotStranded, pod.Name)
+				}
+			}
+			if diff := cmp.Diff(tc.wantStranded, gotStranded, cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("deleted members (-want +got):\n%s", diff)
+			}
+			var gotEvents []string
+			for _, ev := range recorder.RecordedEvents {
+				if ev.Reason == ReasonStrandedPodDeleted {
+					gotEvents = append(gotEvents, ev.Key.Name)
+				}
+			}
+			if diff := cmp.Diff(tc.wantStranded, gotEvents, cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("StrandedPodDeleted events (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestStrandedMemberCountsAsFailed(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{features.ElasticJobsViaWorkloadSlicesForPodGroups: true})
+	ctx, _ := utiltesting.ContextWithLog(t)
+	// A group of two: one member succeeded, the other was deleted by a domain
+	// failover and also ended with exit code 0.
+	succeeded := elasticGroupMember("grp-0").GroupTotalCount("2").UID("grp-0").KueueFinalizer().RoleHash(elasticTestRoleHash).
+		NodeName("y1").StatusPhase(corev1.PodSucceeded).Obj()
+	stranded := elasticGroupMember("grp-1").GroupTotalCount("2").UID("grp-1").KueueFinalizer().RoleHash(elasticTestRoleHash).
+		NodeName("x1").StatusPhase(corev1.PodSucceeded).DeletionTimestamp(now).
+		StatusConditions(corev1.PodCondition{Type: corev1.PodConditionType(ConditionTypeTerminationTarget), Status: corev1.ConditionTrue, Reason: ReasonTopologyDomainFailover}).Obj()
+	group := elasticGroup(succeeded, stranded)
+
+	reclaimable, err := group.ReclaimablePods(ctx, nil)
+	if err != nil {
+		t.Fatalf("ReclaimablePods() error = %v", err)
+	}
+	want := []kueue.ReclaimablePod{{Name: kueue.NewPodSetReference(elasticTestRoleHash), Count: 1}}
+	if diff := cmp.Diff(want, reclaimable); diff != "" {
+		t.Errorf("ReclaimablePods() (-want +got):\n%s", diff)
+	}
+	if _, _, finished := group.Finished(ctx); finished {
+		t.Errorf("Finished() = true, want the group to wait for the stranded member's replacement")
 	}
 }

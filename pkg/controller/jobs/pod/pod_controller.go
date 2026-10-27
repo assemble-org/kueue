@@ -66,6 +66,7 @@ import (
 	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
 	"sigs.k8s.io/kueue/pkg/util/roletracker"
 	utilslices "sigs.k8s.io/kueue/pkg/util/slices"
+	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
 	"sigs.k8s.io/kueue/pkg/workload"
 	workloadfinish "sigs.k8s.io/kueue/pkg/workload/finish"
 	"sigs.k8s.io/kueue/pkg/workloadslicing"
@@ -83,6 +84,8 @@ var errMsgIncorrectGroupRoleCount = fmt.Sprintf("pod group can't include more th
 // Event reasons used by the pod controller
 const (
 	ReasonExcessPodDeleted       = "ExcessPodDeleted"
+	ReasonStrandedPodDeleted     = "StrandedPodDeleted"
+	ReasonTopologyDomainFailover = "TopologyDomainFailover"
 	ReasonOwnerReferencesAdded   = "OwnerReferencesAdded"
 	ReasonWorkloadNameConflict   = "WorkloadNameConflict"
 	ReasonPodExceedsRoleRequests = "PodExceedsRoleRequests"
@@ -445,7 +448,7 @@ func (p *Pod) Finished(ctx context.Context) (message string, success, finished b
 		return message, success, false
 	}
 	for _, pod := range p.list.Items {
-		if pod.Status.Phase == corev1.PodSucceeded {
+		if pod.Status.Phase == corev1.PodSucceeded && !deletedForDomainFailover(&pod) {
 			succeededCount++
 		}
 
@@ -1475,8 +1478,12 @@ func (p *Pod) shouldFinalizeNow(pod *corev1.Pod, stopReason jobframework.StopRea
 // isPodRunnableOrSucceeded returns whether the Pod can eventually run, is Running or Succeeded.
 // A Pod cannot run if it's gated or has no node assignment while having a deletionTimestamp.
 // For serving groups, a terminated pod that's being deleted also can't run, even if it kept
-// its NodeName - see shouldFinalizeNow for why this is scoped to serving groups.
+// its NodeName - see shouldFinalizeNow for why this is scoped to serving groups. A member
+// Kueue deleted for a domain failover is replaced, so it does not count either.
 func isPodRunnableOrSucceeded(p *corev1.Pod) bool {
+	if deletedForDomainFailover(p) {
+		return false
+	}
 	if !p.DeletionTimestamp.IsZero() {
 		serving := p.Annotations[podconstants.GroupServingAnnotationKey] == podconstants.GroupServingAnnotationValue
 		if len(p.Spec.NodeName) == 0 || (serving && utilpod.IsTerminated(p)) {
@@ -2037,16 +2044,20 @@ func (p *Pod) partitionGroupMembers(workload *kueue.Workload) (groupMembers, err
 // member replaced are finalized, as FindMatchingWorkloads does for a Workload
 // it matched itself. The reconciler calls it with the Workload it found on the
 // workload-slice path, which a group reaches without FindMatchingWorkloads.
-func (p *Pod) CleanupMembers(ctx context.Context, c client.Client, r events.EventRecorder, workload *kueue.Workload) error {
+func (p *Pod) CleanupMembers(ctx context.Context, c client.Client, r events.EventRecorder, wl *kueue.Workload) error {
 	if !p.isGroup {
 		return nil
 	}
-	members, err := p.partitionGroupMembers(workload)
+	members, err := p.partitionGroupMembers(wl)
+	if err != nil {
+		return err
+	}
+	stranded, err := p.strandedMembers(ctx, c, wl, members.kept)
 	if err != nil {
 		return err
 	}
 	// Do not clean up more pods until observing previous operations
-	if (len(members.excess) > 0 || len(members.replaced) > 0) && !p.satisfiedExcessPods {
+	if (len(members.excess) > 0 || len(members.replaced) > 0 || len(stranded) > 0) && !p.satisfiedExcessPods {
 		return errPendingOps
 	}
 	p.absentPods = members.absent
@@ -2054,7 +2065,167 @@ func (p *Pod) CleanupMembers(ctx context.Context, c client.Client, r events.Even
 	if err := p.removeExcessPods(ctx, c, r, members.excess); err != nil {
 		return err
 	}
+	if err := p.terminateStrandedMembers(ctx, c, r, stranded); err != nil {
+		return err
+	}
 	return p.finalizePods(ctx, c, members.replaced)
+}
+
+// deletedForDomainFailover reports whether Kueue deleted the pod as a member
+// stranded by a domain failover. Such a member counts like a failed one
+// whatever phase it ends in: a newer member replaces it and it is finalized
+// then, and it is neither succeeded nor reclaimable.
+func deletedForDomainFailover(pod *corev1.Pod) bool {
+	if pod.DeletionTimestamp.IsZero() {
+		return false
+	}
+	return slices.ContainsFunc(pod.Status.Conditions, func(c corev1.PodCondition) bool {
+		return c.Type == corev1.PodConditionType(ConditionTypeTerminationTarget) && c.Status == corev1.ConditionTrue && c.Reason == ReasonTopologyDomainFailover
+	})
+}
+
+// strandedMember is a member bound to a node outside the topology domain its
+// PodSet is assigned to, at the level the PodSet requires.
+type strandedMember struct {
+	pod            corev1.Pod
+	podSet         kueue.PodSetReference
+	level          string
+	podDomain      string
+	assignedDomain string
+}
+
+// strandedMembers finds the members the scheduler's domain failover left
+// behind: for each PodSet that requires a topology level, the kept members
+// bound to a node outside the domain the PodSet is now assigned to at that
+// level. They cannot rejoin the PodSet where it runs; recreated, they are
+// placed into the new domain like any other replacement.
+func (p *Pod) strandedMembers(ctx context.Context, c client.Client, wl *kueue.Workload, kept []corev1.Pod) ([]strandedMember, error) {
+	if !workload.DomainFailoverEnabled(wl) || wl.Status.Admission == nil {
+		return nil, nil
+	}
+	var stranded []strandedMember
+	for _, ps := range wl.Spec.PodSets {
+		if ps.TopologyRequest == nil || ps.TopologyRequest.Required == nil {
+			continue
+		}
+		level := *ps.TopologyRequest.Required
+		assignedDomain, found, err := assignedLevelValue(ctx, c, wl.Status.Admission, ps.Name, level)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			continue
+		}
+		for i := range kept {
+			pod := &kept[i]
+			roleHash, err := getRoleHash(*pod)
+			if err != nil {
+				return nil, err
+			}
+			if roleHash != string(ps.Name) || !pod.DeletionTimestamp.IsZero() || utilpod.IsTerminated(pod) || utilpod.HasGate(pod, kueue.TopologySchedulingGate) {
+				continue
+			}
+			podDomain, found, err := podLevelValue(ctx, c, pod, level)
+			if err != nil {
+				return nil, err
+			}
+			if found && podDomain != assignedDomain {
+				stranded = append(stranded, strandedMember{pod: *pod, podSet: ps.Name, level: level, podDomain: podDomain, assignedDomain: assignedDomain})
+			}
+		}
+	}
+	return stranded, nil
+}
+
+// assignedLevelValue is the value of the topology level the PodSet's assignment
+// occupies. An assignment published at the hostname level alone names nodes, so
+// the value is read off the first assigned node.
+func assignedLevelValue(ctx context.Context, c client.Client, admission *kueue.Admission, podSet kueue.PodSetReference, level string) (string, bool, error) {
+	for i := range admission.PodSetAssignments {
+		psa := &admission.PodSetAssignments[i]
+		if psa.Name != podSet || psa.TopologyAssignment == nil {
+			continue
+		}
+		assignment := utiltas.InternalFrom(psa.TopologyAssignment)
+		if len(assignment.Domains) == 0 {
+			return "", false, nil
+		}
+		values := assignment.Domains[0].Values
+		if idx := slices.Index(assignment.Levels, level); idx >= 0 {
+			return values[idx], true, nil
+		}
+		if !utiltas.IsLowestLevelHostname(assignment.Levels) {
+			return "", false, nil
+		}
+		return nodeLevelValue(ctx, c, values[len(values)-1], level)
+	}
+	return "", false, nil
+}
+
+// podLevelValue is the value of the topology level on the node the pod is bound
+// to, by its node selector when the ungater wrote the level there, otherwise by
+// the node's own label.
+func podLevelValue(ctx context.Context, c client.Client, pod *corev1.Pod, level string) (string, bool, error) {
+	if value, found := pod.Spec.NodeSelector[level]; found {
+		return value, true, nil
+	}
+	nodeName := pod.Spec.NodeName
+	if nodeName == "" {
+		nodeName = pod.Spec.NodeSelector[corev1.LabelHostname]
+	}
+	if nodeName == "" {
+		return "", false, nil
+	}
+	return nodeLevelValue(ctx, c, nodeName, level)
+}
+
+// nodeLevelValue is the value of a topology level's label on a node. A node
+// that is gone has no value; its pods end with it.
+func nodeLevelValue(ctx context.Context, c client.Client, nodeName, level string) (string, bool, error) {
+	var node corev1.Node
+	if err := c.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	value, found := node.Labels[level]
+	return value, found, nil
+}
+
+// terminateStrandedMembers deletes the stranded members the way Stop deletes a
+// group: the TerminationTarget condition marks the deletion as Kueue's, and the
+// finalizer stays so the member is accounted for until its replacement arrives.
+func (p *Pod) terminateStrandedMembers(ctx context.Context, c client.Client, r events.EventRecorder, stranded []strandedMember) error {
+	if len(stranded) == 0 {
+		return nil
+	}
+	log := ctrl.LoggerFrom(ctx)
+	return parallelize.Until(ctx, len(stranded), func(i int) error {
+		member := &stranded[i]
+		pod := &member.pod
+		message := fmt.Sprintf("Pod runs in %s %q while its PodSet %s is assigned to %q", member.level, member.podDomain, member.podSet, member.assignedDomain)
+		podApplyConfig := corev1ac.Pod(pod.Name, pod.Namespace).
+			WithUID(pod.UID).
+			WithStatus(corev1ac.PodStatus().
+				WithConditions(corev1ac.PodCondition().
+					WithType(corev1.PodConditionType(ConditionTypeTerminationTarget)).
+					WithStatus(corev1.ConditionTrue).
+					WithLastTransitionTime(metav1.NewTime(p.clock.Now())).
+					WithReason(ReasonTopologyDomainFailover).
+					WithMessage(message),
+				),
+			)
+		if err := c.Status().Apply(ctx, podApplyConfig, client.FieldOwner(constants.KueueName), client.ForceOwnership); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		log.V(3).Info("Deleting stranded pod in group", "strandedPod", klog.KObj(pod), "level", member.level, "podDomain", member.podDomain, "assignedDomain", member.assignedDomain)
+		if err := c.Delete(ctx, pod); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		r.Eventf(pod, nil, corev1.EventTypeNormal, ReasonStrandedPodDeleted, "StrandedPodDeleted", message)
+		return nil
+	})
 }
 
 func (p *Pod) countAbsentPods(ps kueue.PodSet, activePods int) int {
@@ -2116,7 +2287,7 @@ func (p *Pod) ReclaimablePods(ctx context.Context, _ client.Client) ([]kueue.Rec
 
 	var result []kueue.ReclaimablePod
 	for _, pod := range p.list.Items {
-		if pod.Status.Phase == corev1.PodSucceeded {
+		if pod.Status.Phase == corev1.PodSucceeded && !deletedForDomainFailover(&pod) {
 			roleHash, err := getRoleHash(pod)
 			if err != nil {
 				return nil, err

@@ -62,6 +62,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/util/resourcegroups"
 	"sigs.k8s.io/kueue/pkg/util/roletracker"
 	"sigs.k8s.io/kueue/pkg/util/routine"
+	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
 	"sigs.k8s.io/kueue/pkg/util/wait"
 	"sigs.k8s.io/kueue/pkg/workload"
 	"sigs.k8s.io/kueue/pkg/workload/concurrentadmission"
@@ -1012,6 +1013,9 @@ func (s *Scheduler) admit(ctx context.Context, e *entry, cq *schdcache.ClusterQu
 		ClusterQueue:      e.ClusterQueue,
 		PodSetAssignments: e.assignment.ToAPI(log),
 	}
+	if workload.NeedsSecondPass(e.Obj) {
+		keepAdmittedCounts(admission, e.Obj.Status.Admission)
+	}
 
 	consideredStr := flavorassigner.FormatFlavorAssignmentAttemptsForEvents(e.assignment)
 	cacheWl, err := s.assumeWorkload(ctx, log, e, cq, admission)
@@ -1031,6 +1035,12 @@ func (s *Scheduler) admit(ctx context.Context, e *entry, cq *schdcache.ClusterQu
 			s.recordWorkloadAdmissionMetrics(log, newWorkload, e.Obj, admission, consideredStr)
 			if e.assignment.ZeroCountFlavorFallback != "" && !workload.HasQuotaReservation(e.Obj) {
 				s.recorder.Eventf(newWorkload, nil, corev1.EventTypeWarning, "ZeroCountFlavorFallback", "ZeroCountFlavorFallback", api.TruncateEventMessage(e.assignment.ZeroCountFlavorFallback))
+			}
+			for i := range e.assignment.PodSets {
+				if failover := e.assignment.PodSets[i].DomainFailover; failover != nil {
+					s.recorder.Eventf(newWorkload, nil, corev1.EventTypeNormal, "TopologyDomainFailover", "TopologyDomainFailover",
+						api.TruncateEventMessage(failover.Message(e.assignment.PodSets[i].Name)))
+				}
 			}
 
 			log.V(2).Info("Workload successfully admitted and assigned flavors", "assignments", admission.PodSetAssignments)
@@ -1073,6 +1083,25 @@ func (s *Scheduler) admit(ctx context.Context, e *entry, cq *schdcache.ClusterQu
 	return nil
 }
 
+// keepAdmittedCounts carries each PodSet's admitted count and resource usage
+// into a second-pass admission. The second pass sizes its request net of
+// reclaimable pods, while the Workload webhook lets only the topology
+// assignment change on an existing admission.
+func keepAdmittedCounts(admission, admitted *kueue.Admission) {
+	if admitted == nil {
+		return
+	}
+	for i := range admission.PodSetAssignments {
+		psa := &admission.PodSetAssignments[i]
+		idx := slices.IndexFunc(admitted.PodSetAssignments, func(a kueue.PodSetAssignment) bool { return a.Name == psa.Name })
+		if idx < 0 {
+			continue
+		}
+		psa.Count = admitted.PodSetAssignments[idx].Count
+		psa.ResourceUsage = admitted.PodSetAssignments[idx].ResourceUsage
+	}
+}
+
 func (s *Scheduler) patchWorkloadAdmission(
 	ctx context.Context,
 	log logr.Logger,
@@ -1108,6 +1137,13 @@ func updateUnhealthyNodesAfterTASReplacement(log logr.Logger, wl *kueue.Workload
 		wl.Status.UnhealthyNodes = slices.DeleteFunc(wl.Status.UnhealthyNodes, func(n kueue.UnhealthyNode) bool {
 			return n.Name == replacedNodeName
 		})
+		if features.Enabled(features.ElasticJobsViaWorkloadSlicesDomainFailover) {
+			// A PodSet moved to another topology domain leaves the rest of its
+			// unhealthy nodes behind; nothing is left to replace on them.
+			wl.Status.UnhealthyNodes = slices.DeleteFunc(wl.Status.UnhealthyNodes, func(n kueue.UnhealthyNode) bool {
+				return !utiltas.HasTASAssignmentOnNode(wl.Status.Admission, n.Name)
+			})
+		}
 		log.V(5).Info("Dropping the replaced head node from the workload recovery field, keeping the remaining unhealthy nodes",
 			"replacedNode", replacedNodeName,
 			"remainingUnhealthyNodes", len(wl.Status.UnhealthyNodes))

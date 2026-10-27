@@ -60,6 +60,7 @@ var (
 	prebuiltWorkloadAnnotationPath          = annotationsPath.Key(constants.PrebuiltWorkloadAnnotation)
 	elasticJobAnnotationPath                = annotationsPath.Key(workloadslicing.EnabledAnnotationKey)
 	elasticJobScaleUpStrategyAnnotationPath = annotationsPath.Key(kueueconstants.ElasticJobScaleUpStrategyAnnotationKey)
+	elasticJobDomainFailoverAnnotationPath  = annotationsPath.Key(kueueconstants.ElasticJobDomainFailoverAnnotationKey)
 	waitForPodsReadyAnnotationPath          = annotationsPath.Key(constants.WaitForPodsReadyAnnotation)
 	supportedElasticJobScaleUpStrategies    = sets.New(kueueconstants.ElasticJobScaleUpStrategyAtomic, kueueconstants.ElasticJobScaleUpStrategyPartial)
 	supportedElasticJobGVKs                 = sets.New(
@@ -141,9 +142,11 @@ func validateCreateForPrebuiltWorkload(job GenericJob) field.ErrorList {
 }
 
 // ValidateElasticJobAnnotation rejects the elastic-job annotation on unsupported frameworks
-// and validates the optional elastic-job-scale-up-strategy annotation.
+// and validates the optional elastic-job-scale-up-strategy and
+// elastic-job-domain-failover annotations.
 func ValidateElasticJobAnnotation(obj client.Object, gvk schema.GroupVersionKind) field.ErrorList {
 	allErrs := validateElasticJobScaleUpStrategyAnnotation(obj)
+	allErrs = append(allErrs, validateElasticJobDomainFailoverAnnotation(obj)...)
 	if !workloadslicing.Enabled(obj) {
 		return allErrs
 	}
@@ -189,6 +192,28 @@ func validateElasticJobScaleUpStrategyAnnotation(obj client.Object) field.ErrorL
 	}
 	if !supportedElasticJobScaleUpStrategies.Has(strategy) {
 		allErrs = append(allErrs, field.NotSupported(elasticJobScaleUpStrategyAnnotationPath, strategy, sets.List(supportedElasticJobScaleUpStrategies)))
+	}
+	return allErrs
+}
+
+// validateElasticJobDomainFailoverAnnotation validates kueue.x-k8s.io/elastic-job-domain-failover
+// only when ElasticJobsViaWorkloadSlicesDomainFailover is enabled; with the gate off the
+// annotation is allowed and ignored. With the gate on, the job must be opted into
+// elastic-job and the only accepted value is "true".
+func validateElasticJobDomainFailoverAnnotation(obj client.Object) field.ErrorList {
+	annotations := obj.GetAnnotations()
+	value, found := annotations[kueueconstants.ElasticJobDomainFailoverAnnotationKey]
+	if !found || !features.Enabled(features.ElasticJobsViaWorkloadSlicesDomainFailover) {
+		return nil
+	}
+
+	var allErrs field.ErrorList
+	if annotations[workloadslicing.EnabledAnnotationKey] != workloadslicing.EnabledAnnotationValue {
+		allErrs = append(allErrs, field.Forbidden(elasticJobDomainFailoverAnnotationPath,
+			fmt.Sprintf("requires the %q annotation set to %q", workloadslicing.EnabledAnnotationKey, workloadslicing.EnabledAnnotationValue)))
+	}
+	if value != kueueconstants.ElasticJobDomainFailoverAnnotationValue {
+		allErrs = append(allErrs, field.NotSupported(elasticJobDomainFailoverAnnotationPath, value, []string{kueueconstants.ElasticJobDomainFailoverAnnotationValue}))
 	}
 	return allErrs
 }
