@@ -197,6 +197,15 @@ func (p *Preemptor) buildContext(
 		tasRequests = assignment.WorkloadsTopologyRequests(log, &wl, cq)
 	}
 
+	// A preemptor taking a second pass keeps its admitted counts, and the snapshot
+	// already carries its reservation, so it needs no quota on top of what it holds
+	// and only its topology assignment has to fit, as in the scheduler's own fit
+	// check. Sized at its full request, it could never fit next to its own usage.
+	var quotaNeeded resources.FlavorResourceQuantities
+	if !workload.NeedsSecondPass(wl.Obj) {
+		quotaNeeded = assignment.TotalRequestsFor(log, &wl)
+	}
+
 	return &preemptionCtx{
 		clock:             p.clock,
 		preemptor:         wl,
@@ -206,7 +215,7 @@ func (p *Preemptor) buildContext(
 		frsNeedPreemption: flavorResourcesNeedPreemption(assignment),
 		workloadUsage: workload.Usage{
 			Quota: workload.ResourceUsage{
-				Assigned: assignment.TotalRequestsFor(log, &wl),
+				Assigned: quotaNeeded,
 			},
 			TAS: wl.TASUsage(),
 		},

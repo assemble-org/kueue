@@ -49,6 +49,7 @@ import (
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 	"sigs.k8s.io/kueue/pkg/cache/scheduler/simulator"
 	"sigs.k8s.io/kueue/pkg/cache/scheduler/was"
+	"sigs.k8s.io/kueue/pkg/constants"
 	tasindexer "sigs.k8s.io/kueue/pkg/controller/tas/indexer"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
@@ -318,6 +319,31 @@ func TestScheduleForTAS(t *testing.T) {
 		*utiltestingapi.MakeLocalQueue("tas-main", "default").ClusterQueue("tas-main").Obj(),
 	}
 	eventIgnoreMessage := cmpopts.IgnoreFields(utiltesting.EventRecord{}, "Message")
+	// failoverRackNode is a one-CPU node in the given rack of block b1.
+	failoverRackNode := func(name, rack string) corev1.Node {
+		return *testingnode.MakeNode(name).
+			Label("tas-node", "true").
+			Label(tasBlockLabel, "b1").
+			Label(tasRackLabel, rack).
+			Label(corev1.LabelHostname, name).
+			StatusAllocatable(corev1.ResourceList{
+				corev1.ResourceCPU:  resource.MustParse("1"),
+				corev1.ResourcePods: resource.MustParse("10"),
+			}).
+			Ready().
+			Obj()
+	}
+	// failoverAdmission is the admission of a PodSet of one-CPU pods, one per listed host.
+	failoverAdmission := func(name kueue.PodSetReference, hosts ...string) *utiltestingapi.PodSetAssignmentWrapper {
+		ta := utiltestingapi.MakeTopologyAssignment(utiltas.Levels(&defaultSingleLevelTopology))
+		for _, host := range hosts {
+			ta = ta.Domain(utiltestingapi.MakeTopologyDomainAssignment([]string{host}, 1).Obj())
+		}
+		return utiltestingapi.MakePodSetAssignment(name).
+			Count(int32(len(hosts))).
+			Assignment(corev1.ResourceCPU, "tas-default", fmt.Sprintf("%d000m", len(hosts))).
+			TopologyAssignment(ta.Obj())
+	}
 	cases := map[string]tasScheduleForTASCase{
 		"initial scheduling; one-byte memory request fits on a 2Gi node with vectorized requests disabled": {
 			nodes: []corev1.Node{
@@ -1341,6 +1367,73 @@ func TestScheduleForTAS(t *testing.T) {
 				utiltesting.MakeEventRecord("default", "foo", "SecondPassFailed", corev1.EventTypeWarning).
 					Message(`couldn't assign flavors to pod set one: topology "tas-three-level" doesn't allow to fit any of 1 pod(s). Total nodes: 6; excluded: resource "cpu": 1, topologyDomain: 5`).
 					Obj(),
+			},
+		},
+		"second pass; domain failover preempts a lower-priority occupant while the preemptor holds most of the quota": {
+			// foo holds 4 of the queue's 6 CPUs. r1 lost b1 and rack rb cannot run its
+			// 2 pods again, so r1 must move to rack rc, where occupant holds c1. foo's
+			// second pass keeps its reservation and needs no quota on top of it, so the
+			// preemption only has to free the second node of rack rc. Sized at its full
+			// 4 CPUs instead, foo would never fit next to its own usage and nothing
+			// would be preempted.
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlicesDomainFailover: true,
+				features.TASFailedNodeReplacementFailFast:           false,
+			},
+			nodes: []corev1.Node{
+				failoverRackNode("a1", "ra"), failoverRackNode("a2", "ra"),
+				failoverRackNode("b1", "rb"), failoverRackNode("b2", "rb"),
+				failoverRackNode("c1", "rc"), failoverRackNode("c2", "rc"),
+			},
+			topologies:      []kueue.Topology{defaultThreeLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASThreeLevelFlavor},
+			clusterQueues: []kueue.ClusterQueue{
+				*utiltestingapi.MakeClusterQueue("tas-main").
+					Preemption(kueue.ClusterQueuePreemption{WithinClusterQueue: kueue.PreemptionPolicyLowerPriority}).
+					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").Resource(corev1.ResourceCPU, "6").Obj()).
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					Annotation(constants.ElasticJobAnnotation, "true").
+					Annotation(constants.ElasticJobDomainFailoverAnnotationKey, constants.ElasticJobDomainFailoverAnnotationValue).
+					UnhealthyNodes("b1").
+					Queue("tas-main").
+					PodSets(
+						*utiltestingapi.MakePodSet("r0", 2).RequiredTopologyRequest(tasRackLabel).Request(corev1.ResourceCPU, "1").Obj(),
+						*utiltestingapi.MakePodSet("r1", 2).RequiredTopologyRequest(tasRackLabel).Request(corev1.ResourceCPU, "1").Obj(),
+					).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(failoverAdmission("r0", "a1", "a2").Obj(), failoverAdmission("r1", "b1", "b2").Obj()).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+				*utiltestingapi.MakeWorkload("occupant", "default").
+					Priority(-1).
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).RequiredTopologyRequest(tasRackLabel).Request(corev1.ResourceCPU, "1").Obj()).
+					ReserveQuotaAt(
+						utiltestingapi.MakeAdmission("tas-main").
+							PodSets(failoverAdmission("one", "c1").Obj()).
+							Obj(), now,
+					).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			// The move waits for the preemption, so foo's admission is unchanged this cycle.
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/foo": *utiltestingapi.MakeAdmission("tas-main").
+					PodSets(failoverAdmission("r0", "a1", "a2").Obj(), failoverAdmission("r1", "b1", "b2").Obj()).
+					Obj(),
+			},
+			eventCmpOpts: cmp.Options{eventIgnoreMessage},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "occupant", "EvictedDueToPreempted", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "occupant", "Preempted", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "foo", "PreemptedWorkload", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "foo", "SecondPassFailed", corev1.EventTypeWarning).Obj(),
 			},
 		},
 		"workload with unhealthyNode annotation; second pass; two podsets": {
