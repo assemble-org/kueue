@@ -26,6 +26,7 @@ import (
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	eventsv1 "k8s.io/api/events/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -381,6 +382,24 @@ func (s *rackScenario) expectEventSince(wl *kueue.Workload, reason string, befor
 	}, behavioral.LongTimeout, behavioral.Interval).Should(gomega.Succeed())
 }
 
+// expectFailoverEvent waits for the event reporting that the PodSet moved from
+// one rack to another, placed with `count` of its `admitted` pods, after its
+// rack could run only `healthy` of the `minimum` pods it needs.
+func (s *rackScenario) expectFailoverEvent(role kueue.PodSetReference, from, to string, count, admitted, healthy, minimum int32) {
+	ginkgo.GinkgoHelper()
+	placed := ""
+	if count < admitted {
+		placed = fmt.Sprintf(" at %d of its %d pods", count, admitted)
+	}
+	fromDomain, toDomain := "b1,"+from, "b1,"+to
+	behavioral.ExpectEventAppeared(ctx, k8sClient, eventsv1.Event{
+		Reason: "TopologyDomainFailover",
+		Type:   corev1.EventTypeNormal,
+		Note: fmt.Sprintf("PodSet %s moved from %s %q to %q%s: %q can run %d of the %d pods the PodSet needs at minimum",
+			role, utiltesting.DefaultRackTopologyLevel, fromDomain, toDomain, placed, fromDomain, healthy, minimum),
+	})
+}
+
 var _ = ginkgo.Describe("Topology Aware Scheduling rack scenarios", ginkgo.Ordered, func() {
 	var (
 		ns *corev1.Namespace
@@ -444,24 +463,27 @@ var _ = ginkgo.Describe("Topology Aware Scheduling rack scenarios", ginkgo.Order
 		}, behavioral.LongConsistentDuration, behavioral.Interval).Should(gomega.Succeed())
 	})
 
-	// threeRacksTwoRoles admits two single-node lower-priority occupants into rack c
-	// and a two-role job of 18 nodes per role, admissible down to 16, into racks a
-	// and b, then fails three rack-b nodes one at a time. The first two failures keep
-	// the role at or above its minimum, so it stays; the third drops it to 15 and
-	// the second pass preempts the occupants to make room for the role in rack c.
-	// It returns the job, the occupants and the PodSets in racks b and a.
-	threeRacksTwoRoles := func() (job *kueue.Workload, occupants []*kueue.Workload, moving, staying kueue.PodSetReference) {
-		ginkgo.GinkgoHelper()
-		s = newRackScenario(ns, rackSpec{"a", 18}, rackSpec{"b", 18}, rackSpec{"c", 18})
-		const lowPriority, jobPriority = 1, 10
+	const lowPriority, jobPriority, highPriority = 1, 10, 20
 
-		ginkgo.By("admitting two single-node lower-priority occupants into rack c", func() {
-			for i := range 2 {
-				occupant := s.admit(s.occupant(fmt.Sprintf("occupant-%d", i), "c", 1, lowPriority))
-				s.expectRoleInRack(occupant, "main", "c", behavioral.Timeout)
-				occupants = append(occupants, occupant)
-			}
-		})
+	// loseRackB admits the given number of single-node occupants at the given
+	// priority into rack c, then a two-role job of 18 nodes per role, admissible
+	// down to 16, at priority 10 into racks a and b, and fails three rack-b nodes
+	// one at a time. The first two failures keep the role at or above its minimum,
+	// so it stays; the third drops it to 15, below the minimum. It returns the job,
+	// the occupants and the PodSets in racks b and a.
+	loseRackB := func(rackC rackSpec, occupantCount int, occupantPriority int32) (job *kueue.Workload, occupants []*kueue.Workload, moving, staying kueue.PodSetReference) {
+		ginkgo.GinkgoHelper()
+		s = newRackScenario(ns, rackSpec{"a", 18}, rackSpec{"b", 18}, rackC)
+
+		if occupantCount > 0 {
+			ginkgo.By(fmt.Sprintf("admitting %d single-node occupants at priority %d into rack c", occupantCount, occupantPriority), func() {
+				for i := range occupantCount {
+					occupant := s.admit(s.occupant(fmt.Sprintf("occupant-%d", i), "c", 1, occupantPriority))
+					s.expectRoleInRack(occupant, "main", "c", behavioral.Timeout)
+					occupants = append(occupants, occupant)
+				}
+			})
+		}
 
 		var rackOfRole map[kueue.PodSetReference]string
 		ginkgo.By("admitting a two-role job of 18 nodes per role with a minimum of 16 into racks a and b", func() {
@@ -482,16 +504,19 @@ var _ = ginkgo.Describe("Topology Aware Scheduling rack scenarios", ginkgo.Order
 			}
 		})
 
-		ginkgo.By("failing a third rack-b node, which drops the role to 15 and preempts the occupants of rack c", func() {
+		ginkgo.By("failing a third rack-b node, which drops the role to 15", func() {
 			s.failNode(failed[2])
 			s.expectUnhealthyNodes(job, failed...)
-			s.expectPreempted(occupants...)
 		})
 		return job, occupants, moving, staying
 	}
 
 	ginkgo.It("moves a role to the rack of preempted lower-priority occupants once three of its nodes fail", framework.SlowSpec, func() {
-		job, occupants, moving, staying := threeRacksTwoRoles()
+		job, occupants, moving, staying := loseRackB(rackSpec{"c", 18}, 2, lowPriority)
+
+		ginkgo.By("preempting the occupants of rack c, which fits the whole role once they are gone", func() {
+			s.expectPreempted(occupants...)
+		})
 
 		ginkgo.By("removing the preempted occupants, as the deletion of their jobs would", func() {
 			s.remove(occupants...)
@@ -499,9 +524,51 @@ var _ = ginkgo.Describe("Topology Aware Scheduling rack scenarios", ginkgo.Order
 
 		ginkgo.By("moving the role to rack c at its admitted count of 18 and leaving the other role in rack a", func() {
 			s.expectRoleInRack(job, moving, "c", behavioral.LongTimeout)
+			gomega.Expect(roleCount(job, moving)).To(gomega.Equal(int32(18)))
 			s.expectRoleInRack(job, staying, "a", behavioral.Timeout)
 			s.expectUnhealthyNodes(job)
-			s.expectEventSince(job, "TopologyDomainFailover", 0)
+			s.expectFailoverEvent(moving, "b", "c", 18, 18, 15, 16)
+		})
+	})
+
+	// A spare rack smaller than the role takes it at the most pods it fits, down to
+	// the role's minimum.
+	ginkgo.DescribeTable("moves a role to a smaller spare rack at the most pods it fits once three of its nodes fail", framework.SlowSpec,
+		func(nodesInC int) {
+			job, _, moving, staying := loseRackB(rackSpec{"c", nodesInC}, 0, 0)
+
+			ginkgo.By(fmt.Sprintf("moving the role to rack c at %d of its 18 pods and leaving the other role in rack a", nodesInC), func() {
+				s.expectRoleInRack(job, moving, "c", behavioral.LongTimeout)
+				gomega.Expect(roleCount(job, moving)).To(gomega.Equal(int32(nodesInC)))
+				s.expectRoleInRack(job, staying, "a", behavioral.Timeout)
+				gomega.Expect(roleCount(job, staying)).To(gomega.Equal(int32(18)))
+				s.expectUnhealthyNodes(job)
+				s.expectFailoverEvent(moving, "b", "c", int32(nodesInC), 18, 15, 16)
+			})
+		},
+		ginkgo.Entry("a rack of 16 takes the role at its minimum of 16", 16),
+		ginkgo.Entry("a rack of 17 takes the role at 17", 17),
+	)
+
+	ginkgo.It("moves a role at fewer pods rather than preempting occupants that outrank it", framework.SlowSpec, func() {
+		job, occupants, moving, staying := loseRackB(rackSpec{"c", 18}, 2, highPriority)
+
+		ginkgo.By("moving the role to the 16 free nodes of rack c and leaving the other role in rack a", func() {
+			s.expectRoleInRack(job, moving, "c", behavioral.LongTimeout)
+			gomega.Expect(roleCount(job, moving)).To(gomega.Equal(int32(16)))
+			s.expectRoleInRack(job, staying, "a", behavioral.Timeout)
+			s.expectUnhealthyNodes(job)
+			s.expectFailoverEvent(moving, "b", "c", 16, 18, 15, 16)
+		})
+
+		ginkgo.By("leaving the higher-priority occupants admitted", func() {
+			gomega.Consistently(func(g gomega.Gomega) {
+				for _, occupant := range occupants {
+					g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(occupant), occupant)).To(gomega.Succeed())
+					g.Expect(workload.IsAdmitted(occupant)).To(gomega.BeTrue(), "occupant %s is no longer admitted", occupant.Name)
+					g.Expect(apimeta.IsStatusConditionTrue(occupant.Status.Conditions, kueue.WorkloadEvicted)).To(gomega.BeFalse(), "occupant %s was evicted", occupant.Name)
+				}
+			}, behavioral.ConsistentDuration, behavioral.Interval).Should(gomega.Succeed())
 		})
 	})
 
@@ -511,7 +578,11 @@ var _ = ginkgo.Describe("Topology Aware Scheduling rack scenarios", ginkgo.Order
 	// Observed 2026-10-28: both occupants were re-admitted 10 ms after their
 	// reservations were released, while the role's retry was 8 s away.
 	ginkgo.PIt("moves a role before re-admitting the lower-priority occupants it preempted", framework.SlowSpec, func() {
-		job, occupants, moving, staying := threeRacksTwoRoles()
+		job, occupants, moving, staying := loseRackB(rackSpec{"c", 18}, 2, lowPriority)
+
+		ginkgo.By("preempting the occupants of rack c, which fits the whole role once they are gone", func() {
+			s.expectPreempted(occupants...)
+		})
 
 		ginkgo.By("releasing the occupants' reservations, as their job controllers would, which requeues them", func() {
 			behavioral.FinishEvictionForWorkloads(ctx, k8sClient, occupants...)

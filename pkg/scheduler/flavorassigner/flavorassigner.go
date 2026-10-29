@@ -256,6 +256,19 @@ type FlavorAssigner struct {
 	// schedulingCycle is the cycle this assignment is being computed in. It is recorded
 	// on the assignment so that a later cycle can tell how old the assignment is.
 	schedulingCycle int64
+
+	// reducedCountFailover lets a PodSet that has to leave its topology domain
+	// be placed at fewer pods than its admission covers, down to its MinCount,
+	// when no domain fits the admitted count.
+	reducedCountFailover bool
+}
+
+// WithReducedCountFailover lets the assignments computed from now on move a
+// PodSet to another topology domain at fewer pods than its admission covers,
+// down to its MinCount, when no domain fits the admitted count.
+func (a *FlavorAssigner) WithReducedCountFailover() *FlavorAssigner {
+	a.reducedCountFailover = true
+	return a
 }
 
 func New(
@@ -331,6 +344,7 @@ func (a *FlavorAssigner) AssignFlavors(
 			a.wl.SchedulingHash,
 		),
 		replaceWorkloadSlice: a.replaceWorkloadSlice,
+		ReducedCountFailover: a.reducedCountFailover,
 	}
 
 	groupedRequests := orderedgroups.NewOrderedGroups[tas.PodSetGroupKey, indexedPodSet]()

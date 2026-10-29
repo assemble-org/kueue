@@ -2039,6 +2039,7 @@ func prepareWorkloadSliceForScaleUp(ctx context.Context, c client.Client, job Ge
 		prevPodSets := slices.ToRefMap(prevWl.Spec.PodSets, func(ps *kueue.PodSet) kueue.PodSetReference {
 			return ps.Name
 		})
+		_, composable := job.(ComposableJob)
 		admitted := int32(0)
 		for i := range podSets {
 			if prevAdmittedCount, ok := grantedCounts[podSets[i].Name]; ok {
@@ -2049,6 +2050,13 @@ func prepareWorkloadSliceForScaleUp(ctx context.Context, c client.Client, job Ge
 			prevPodSet := prevPodSets[podSets[i].Name]
 			if prevPodSet != nil && prevPodSet.Count != podSets[i].Count {
 				extra = ""
+			}
+			// A composable job reads its PodSet templates off live members, and a
+			// released member carries the node selector the ungaters injected. A
+			// slice of the chain takes the predecessor's template, so its new members
+			// are not pinned to the nodes the earlier ones run on.
+			if prevPodSet != nil && composable {
+				podSets[i].Template = *prevPodSet.Template.DeepCopy()
 			}
 			// The baseline is copied forward from the matching predecessor's own floor, not
 			// recomputed from its live grant, so it keeps tracing back to the chain's

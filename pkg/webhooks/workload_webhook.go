@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/util/priority"
 	"sigs.k8s.io/kueue/pkg/util/roletracker"
 	utilslices "sigs.k8s.io/kueue/pkg/util/slices"
+	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
 	"sigs.k8s.io/kueue/pkg/util/webhook"
 	"sigs.k8s.io/kueue/pkg/workload"
 	"sigs.k8s.io/kueue/pkg/workloadslicing"
@@ -382,7 +383,7 @@ func ValidateWorkloadUpdate(newObj, oldObj *kueue.Workload) field.ErrorList {
 	if workload.HasQuotaReservation(newObj) && workload.HasQuotaReservation(oldObj) {
 		allErrs = append(allErrs, validateReclaimablePodsUpdate(newObj, oldObj, field.NewPath("status", "reclaimablePods"))...)
 	}
-	allErrs = append(allErrs, validateAdmissionUpdate(newObj.Status.Admission, oldObj.Status.Admission, field.NewPath("status", "admission"))...)
+	allErrs = append(allErrs, validateAdmissionUpdate(newObj, oldObj, field.NewPath("status", "admission"))...)
 	allErrs = append(allErrs, validateImmutablePodSetUpdates(newObj, oldObj, statusPath.Child("admissionChecks"))...)
 	allErrs = append(allErrs, validateClusterNameUpdate(newObj, oldObj, statusPath)...)
 
@@ -394,8 +395,10 @@ func ValidateWorkloadUpdate(newObj, oldObj *kueue.Workload) field.ErrorList {
 }
 
 // validateAdmissionUpdate validates that admission can be set or unset, but the
-// fields within can't change.
-func validateAdmissionUpdate(new, old *kueue.Admission, path *field.Path) field.ErrorList {
+// fields within can't change, apart from a topology assignment being set and a
+// PodSet moved to another topology domain at fewer pods taking that count.
+func validateAdmissionUpdate(newObj, oldObj *kueue.Workload, path *field.Path) field.ErrorList {
+	new, old := newObj.Status.Admission, oldObj.Status.Admission
 	if old == nil || new == nil {
 		return nil
 	}
@@ -407,9 +410,43 @@ func validateAdmissionUpdate(new, old *kueue.Admission, path *field.Path) field.
 		for i := range new.PodSetAssignments {
 			old.PodSetAssignments[i].TopologyAssignment = new.PodSetAssignments[i].TopologyAssignment
 			old.PodSetAssignments[i].DelayedTopologyRequest = new.PodSetAssignments[i].DelayedTopologyRequest
+			if movedAtFewerPods(newObj, oldObj, i) {
+				old.PodSetAssignments[i].Count = new.PodSetAssignments[i].Count
+				old.PodSetAssignments[i].ResourceUsage = new.PodSetAssignments[i].ResourceUsage
+			}
 		}
 	}
 	return apivalidation.ValidateImmutableField(new, old, path)
+}
+
+// movedAtFewerPods reports whether the i-th PodSet assignment of newObj is
+// oldObj's moved to another topology domain at fewer pods: the Workload is
+// opted into domain failover and had a node to replace, the count dropped to
+// no less than the PodSet's minimum, the new topology assignment covers
+// exactly that count, and no resource's usage grew.
+func movedAtFewerPods(newObj, oldObj *kueue.Workload, i int) bool {
+	newPSA, oldPSA := &newObj.Status.Admission.PodSetAssignments[i], &oldObj.Status.Admission.PodSetAssignments[i]
+	if !workload.DomainFailoverEnabled(newObj) || !workload.HasUnhealthyNodes(oldObj) ||
+		newPSA.Count == nil || oldPSA.Count == nil || *newPSA.Count >= *oldPSA.Count || newPSA.TopologyAssignment == nil {
+		return false
+	}
+	idx := slices.IndexFunc(newObj.Spec.PodSets, func(ps kueue.PodSet) bool { return ps.Name == newPSA.Name })
+	if idx < 0 || newObj.Spec.PodSets[idx].MinCount == nil || *newPSA.Count < *newObj.Spec.PodSets[idx].MinCount {
+		return false
+	}
+	if utiltas.CountPodsInAssignment(utiltas.InternalFrom(newPSA.TopologyAssignment)) != *newPSA.Count {
+		return false
+	}
+	if len(newPSA.ResourceUsage) != len(oldPSA.ResourceUsage) {
+		return false
+	}
+	for res, q := range newPSA.ResourceUsage {
+		oldQ, ok := oldPSA.ResourceUsage[res]
+		if !ok || q.Cmp(oldQ) > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // validateReclaimablePodsUpdate validates that the reclaimable counts do not decrease, this should be checked

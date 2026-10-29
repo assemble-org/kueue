@@ -37,6 +37,7 @@ import (
 	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 	kueueconstants "sigs.k8s.io/kueue/pkg/constants"
+	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
 	podconstants "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
 	"sigs.k8s.io/kueue/pkg/features"
@@ -904,5 +905,56 @@ func TestStrandedMemberCountsAsFailed(t *testing.T) {
 	}
 	if _, _, finished := group.Finished(ctx); finished {
 		t.Errorf("Finished() = true, want the group to wait for the stranded member's replacement")
+	}
+}
+
+func TestConstructComposableWorkloadProbeTemplate(t *testing.T) {
+	features.SetFeatureGatesDuringTest(t, map[featuregate.Feature]bool{
+		features.ElasticJobsViaWorkloadSlices:                          true,
+		features.ElasticJobsViaWorkloadSlicesForPodGroups:              true,
+		features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
+	})
+	ctx, _ := utiltesting.ContextWithLog(t)
+	// Every member has been released, so each carries the node selector the
+	// ungaters injected.
+	released := func(name, node string) *corev1.Pod {
+		return elasticGroupMember(name).RoleHash("role-a").
+			Annotation(kueueconstants.ElasticJobScaleUpStrategyAnnotationKey, kueueconstants.ElasticJobScaleUpStrategyPartial).
+			NodeSelector("kubernetes.io/hostname", node).
+			NodeSelector("example.com/pool", "gpu").
+			StatusPhase(corev1.PodRunning).Obj()
+	}
+	group := elasticGroup(released("grp-0", "node-a"), released("grp-1", "node-b"), released("grp-2", "node-c"), released("grp-3", "node-d"))
+	// The admitted slice keeps the template the group was created with.
+	admitted := utiltestingapi.MakeWorkload(elasticTestGroup, elasticTestNamespace).
+		Annotation(kueue.WorkloadSliceNameAnnotation, elasticTestGroup).
+		PodSets(*utiltestingapi.MakePodSet("role-a", 4).
+			SetMinimumCount(2).
+			NodeSelector(map[string]string{"example.com/pool": "gpu"}).
+			Obj()).
+		ReserveQuotaAt(utiltestingapi.MakeAdmission("cq").
+			PodSets(utiltestingapi.MakePodSetAssignment("role-a").Count(2).Obj()).
+			Obj(), time.Now()).
+		Obj()
+	cli := utiltesting.NewClientBuilder().
+		WithObjects(admitted).
+		WithIndex(&kueue.Workload{}, indexer.WorkloadSliceNameKey, indexer.IndexWorkloadSliceName).
+		Build()
+
+	wl, err := group.ConstructComposableWorkload(ctx, cli, &utiltesting.EventRecorder{}, nil, nil)
+	if err != nil {
+		t.Fatalf("ConstructComposableWorkload() error = %v", err)
+	}
+	if want := elasticTestGroup + "-scale-up-probe-2"; wl.Name != want {
+		t.Errorf("probe name = %q, want %q", wl.Name, want)
+	}
+	if len(wl.Spec.PodSets) != 1 {
+		t.Fatalf("got %d PodSets, want 1", len(wl.Spec.PodSets))
+	}
+	if diff := cmp.Diff(map[string]string{"example.com/pool": "gpu"}, wl.Spec.PodSets[0].Template.Spec.NodeSelector); diff != "" {
+		t.Errorf("probe template nodeSelector mismatch (-want,+got):\n%s", diff)
+	}
+	if got := ptr.Deref(wl.Spec.PodSets[0].MinCount, 0); got != 2 {
+		t.Errorf("probe minCount = %d, want 2", got)
 	}
 }
