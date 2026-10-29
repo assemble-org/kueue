@@ -1436,6 +1436,144 @@ func TestScheduleForTAS(t *testing.T) {
 				utiltesting.MakeEventRecord("default", "foo", "SecondPassFailed", corev1.EventTypeWarning).Obj(),
 			},
 		},
+		"second pass; domain failover moves the PodSet at fewer pods when no domain fits its admitted count": {
+			// foo runs 3 pods in rack rb with a minimum of 2; b1 and b2 failed, so
+			// rb can run 1. Rack rc has two nodes: it cannot take the 3 admitted
+			// pods and nothing can be preempted for them, so the PodSet moves there
+			// at 2 and the admission carries the smaller count and usage.
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlicesDomainFailover: true,
+				features.TASFailedNodeReplacementFailFast:           false,
+				features.TASReplaceMultipleFailedNodes:              true,
+			},
+			nodes: []corev1.Node{
+				failoverRackNode("b1", "rb"), failoverRackNode("b2", "rb"), failoverRackNode("b3", "rb"),
+				failoverRackNode("c1", "rc"), failoverRackNode("c2", "rc"),
+			},
+			topologies:      []kueue.Topology{defaultThreeLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASThreeLevelFlavor},
+			clusterQueues: []kueue.ClusterQueue{
+				*utiltestingapi.MakeClusterQueue("tas-main").
+					Preemption(kueue.ClusterQueuePreemption{WithinClusterQueue: kueue.PreemptionPolicyLowerPriority}).
+					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").Resource(corev1.ResourceCPU, "5").Obj()).
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					Annotation(constants.ElasticJobAnnotation, "true").
+					Annotation(constants.ElasticJobDomainFailoverAnnotationKey, constants.ElasticJobDomainFailoverAnnotationValue).
+					UnhealthyNodes("b1", "b2").
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("one", 3).RequiredTopologyRequest(tasRackLabel).SetMinimumCount(2).Request(corev1.ResourceCPU, "1").Obj()).
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("tas-main").PodSets(failoverAdmission("one", "b1", "b2", "b3").Obj()).Obj(), now).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/foo": *utiltestingapi.MakeAdmission("tas-main").PodSets(failoverAdmission("one", "c1", "c2").Obj()).Obj(),
+			},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "foo", "TopologyDomainFailover", corev1.EventTypeNormal).
+					Message(`PodSet one moved from cloud.provider.com/rack "b1,rb" to "b1,rc" at 2 of its 3 pods: "b1,rb" can run 1 of the 2 pods the PodSet needs at minimum`).Obj(),
+			},
+		},
+		"second pass; domain failover preempts for the admitted count before moving the PodSet at fewer pods": {
+			// Rack rc fits the 3 admitted pods once its lower-priority occupant is
+			// gone, so the second pass preempts it instead of settling for 2 pods.
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlicesDomainFailover: true,
+				features.TASFailedNodeReplacementFailFast:           false,
+				features.TASReplaceMultipleFailedNodes:              true,
+			},
+			nodes: []corev1.Node{
+				failoverRackNode("b1", "rb"), failoverRackNode("b2", "rb"), failoverRackNode("b3", "rb"),
+				failoverRackNode("c1", "rc"), failoverRackNode("c2", "rc"), failoverRackNode("c3", "rc"),
+			},
+			topologies:      []kueue.Topology{defaultThreeLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASThreeLevelFlavor},
+			clusterQueues: []kueue.ClusterQueue{
+				*utiltestingapi.MakeClusterQueue("tas-main").
+					Preemption(kueue.ClusterQueuePreemption{WithinClusterQueue: kueue.PreemptionPolicyLowerPriority}).
+					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").Resource(corev1.ResourceCPU, "6").Obj()).
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					Annotation(constants.ElasticJobAnnotation, "true").
+					Annotation(constants.ElasticJobDomainFailoverAnnotationKey, constants.ElasticJobDomainFailoverAnnotationValue).
+					UnhealthyNodes("b1", "b2").
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("one", 3).RequiredTopologyRequest(tasRackLabel).SetMinimumCount(2).Request(corev1.ResourceCPU, "1").Obj()).
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("tas-main").PodSets(failoverAdmission("one", "b1", "b2", "b3").Obj()).Obj(), now).
+					AdmittedAt(true, now).
+					Obj(),
+				*utiltestingapi.MakeWorkload("occupant", "default").
+					Priority(-1).
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).RequiredTopologyRequest(tasRackLabel).Request(corev1.ResourceCPU, "1").Obj()).
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("tas-main").PodSets(failoverAdmission("one", "c3").Obj()).Obj(), now).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			// The move waits for the preemption, so foo's admission is unchanged this cycle.
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/foo": *utiltestingapi.MakeAdmission("tas-main").PodSets(failoverAdmission("one", "b1", "b2", "b3").Obj()).Obj(),
+			},
+			eventCmpOpts: cmp.Options{eventIgnoreMessage},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "occupant", "EvictedDueToPreempted", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "occupant", "Preempted", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "foo", "PreemptedWorkload", corev1.EventTypeNormal).Obj(),
+				utiltesting.MakeEventRecord("default", "foo", "SecondPassFailed", corev1.EventTypeWarning).Obj(),
+			},
+		},
+		"second pass; domain failover moves the PodSet at fewer pods when the occupant of the only domain that fits its admitted count outranks it": {
+			// Rack rc would fit the 3 admitted pods, but its occupant has a higher
+			// priority and cannot be preempted, so the PodSet takes the two free
+			// nodes of rc at 2.
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlicesDomainFailover: true,
+				features.TASFailedNodeReplacementFailFast:           false,
+				features.TASReplaceMultipleFailedNodes:              true,
+			},
+			nodes: []corev1.Node{
+				failoverRackNode("b1", "rb"), failoverRackNode("b2", "rb"), failoverRackNode("b3", "rb"),
+				failoverRackNode("c1", "rc"), failoverRackNode("c2", "rc"), failoverRackNode("c3", "rc"),
+			},
+			topologies:      []kueue.Topology{defaultThreeLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASThreeLevelFlavor},
+			clusterQueues: []kueue.ClusterQueue{
+				*utiltestingapi.MakeClusterQueue("tas-main").
+					Preemption(kueue.ClusterQueuePreemption{WithinClusterQueue: kueue.PreemptionPolicyLowerPriority}).
+					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").Resource(corev1.ResourceCPU, "6").Obj()).
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					Annotation(constants.ElasticJobAnnotation, "true").
+					Annotation(constants.ElasticJobDomainFailoverAnnotationKey, constants.ElasticJobDomainFailoverAnnotationValue).
+					UnhealthyNodes("b1", "b2").
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("one", 3).RequiredTopologyRequest(tasRackLabel).SetMinimumCount(2).Request(corev1.ResourceCPU, "1").Obj()).
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("tas-main").PodSets(failoverAdmission("one", "b1", "b2", "b3").Obj()).Obj(), now).
+					AdmittedAt(true, now).
+					Obj(),
+				*utiltestingapi.MakeWorkload("occupant", "default").
+					Priority(5).
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("one", 1).RequiredTopologyRequest(tasRackLabel).Request(corev1.ResourceCPU, "1").Obj()).
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("tas-main").PodSets(failoverAdmission("one", "c3").Obj()).Obj(), now).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/foo": *utiltestingapi.MakeAdmission("tas-main").PodSets(failoverAdmission("one", "c1", "c2").Obj()).Obj(),
+			},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "foo", "TopologyDomainFailover", corev1.EventTypeNormal).
+					Message(`PodSet one moved from cloud.provider.com/rack "b1,rb" to "b1,rc" at 2 of its 3 pods: "b1,rb" can run 1 of the 2 pods the PodSet needs at minimum`).Obj(),
+			},
+		},
 		"workload with unhealthyNode annotation; second pass; two podsets": {
 			nodes:           defaultNodes,
 			admissionChecks: []kueue.AdmissionCheck{defaultProvCheck},

@@ -64,9 +64,12 @@ type PodSetTestCase struct {
 	podSetGroupName    *string
 	previousAssignment *kueue.TopologyAssignment
 	minCount           *int32
-	wantAssignment     *tas.TopologyAssignment
-	wantReason         string
-	wantDomainFailover *DomainFailover
+	// reducedCountFailover lets a domain failover place the PodSet at fewer
+	// pods than its admission covers, down to minCount.
+	reducedCountFailover bool
+	wantAssignment       *tas.TopologyAssignment
+	wantReason           string
+	wantDomainFailover   *DomainFailover
 }
 
 func TestFindTopologyAssignments(t *testing.T) {
@@ -665,7 +668,7 @@ func TestFindTopologyAssignments(t *testing.T) {
 						{Count: 1, Values: []string{"y3"}},
 					},
 				},
-				wantDomainFailover: &DomainFailover{Level: tasRackLabel, From: "r1", To: "r2", MinCount: 2, HealthyCount: 1},
+				wantDomainFailover: &DomainFailover{Level: tasRackLabel, From: "r1", To: "r2", MinCount: 2, HealthyCount: 1, AdmittedCount: 3, Count: 3},
 			}},
 		},
 		"domain failover: the PodSet moves at its admitted count when the request is net of reclaimable pods": {
@@ -690,7 +693,7 @@ func TestFindTopologyAssignments(t *testing.T) {
 						{Count: 1, Values: []string{"y3"}},
 					},
 				},
-				wantDomainFailover: &DomainFailover{Level: tasRackLabel, From: "r1", To: "r2", MinCount: 2, HealthyCount: 1},
+				wantDomainFailover: &DomainFailover{Level: tasRackLabel, From: "r1", To: "r2", MinCount: 2, HealthyCount: 1, AdmittedCount: 3, Count: 3},
 			}},
 		},
 		"domain failover: a domain that can still reach the minimum waits for its repair": {
@@ -724,6 +727,113 @@ func TestFindTopologyAssignments(t *testing.T) {
 					`and no other domain fits its 3 pods: topology "default" allows to fit only 2 out of 3 pod(s). Total nodes: 5; excluded: resource "example.com/gpu": 1`,
 			}},
 		},
+		"domain failover: the PodSet moves at fewer pods when no domain fits its admitted count and a reduced count is allowed": {
+			// r2 and r3 hold two nodes each, so neither fits the 3 admitted pods;
+			// both fit the minimum of 2.
+			featureGates: domainFailoverGates,
+			nodes:        domainFailoverNodes(true, 2, 2),
+			pods:         []corev1.Pod{*domainFailoverFillerPod("x3")},
+			levels:       []string{tasRackLabel, corev1.LabelHostname},
+			workload:     domainFailoverWorkload(true, "x1", "x2"),
+			podSets: []PodSetTestCase{{
+				podSetName:           "main",
+				topologyRequest:      &kueue.PodSetTopologyRequest{Required: new(string(tasRackLabel))},
+				requests:             map[corev1.ResourceName]int64{"example.com/gpu": 1},
+				count:                3,
+				minCount:             new(int32(2)),
+				reducedCountFailover: true,
+				wantAssignment: &tas.TopologyAssignment{
+					Levels: defaultOneLevel,
+					Domains: []tas.TopologyDomainAssignment{
+						{Count: 1, Values: []string{"y1"}},
+						{Count: 1, Values: []string{"y2"}},
+					},
+				},
+				wantDomainFailover: &DomainFailover{Level: tasRackLabel, From: "r1", To: "r2", MinCount: 2, HealthyCount: 1, AdmittedCount: 3, Count: 2},
+			}},
+		},
+		"domain failover: a reduced count is the most pods a domain fits, not the minimum": {
+			// Every node of r1 failed. r2 fits 2 pods and r3 fits 1; the PodSet
+			// can run with 1 but is placed at 2.
+			featureGates: domainFailoverGates,
+			nodes:        domainFailoverNodes(false, 2, 1),
+			levels:       []string{tasRackLabel, corev1.LabelHostname},
+			workload:     domainFailoverWorkload(true, "x1", "x2", "x3"),
+			podSets: []PodSetTestCase{{
+				podSetName:           "main",
+				topologyRequest:      &kueue.PodSetTopologyRequest{Required: new(string(tasRackLabel))},
+				requests:             map[corev1.ResourceName]int64{"example.com/gpu": 1},
+				count:                3,
+				minCount:             new(int32(1)),
+				reducedCountFailover: true,
+				wantAssignment: &tas.TopologyAssignment{
+					Levels: defaultOneLevel,
+					Domains: []tas.TopologyDomainAssignment{
+						{Count: 1, Values: []string{"y1"}},
+						{Count: 1, Values: []string{"y2"}},
+					},
+				},
+				wantDomainFailover: &DomainFailover{Level: tasRackLabel, From: "", To: "r2", MinCount: 1, HealthyCount: 0, AdmittedCount: 3, Count: 2},
+			}},
+		},
+		"domain failover: the admitted count is kept when a domain fits it, even with a reduced count allowed": {
+			featureGates: domainFailoverGates,
+			nodes:        domainFailoverNodes(true, 3, 2),
+			pods:         []corev1.Pod{*domainFailoverFillerPod("x3")},
+			levels:       []string{tasRackLabel, corev1.LabelHostname},
+			workload:     domainFailoverWorkload(true, "x1", "x2"),
+			podSets: []PodSetTestCase{{
+				podSetName:           "main",
+				topologyRequest:      &kueue.PodSetTopologyRequest{Required: new(string(tasRackLabel))},
+				requests:             map[corev1.ResourceName]int64{"example.com/gpu": 1},
+				count:                3,
+				minCount:             new(int32(2)),
+				reducedCountFailover: true,
+				wantAssignment: &tas.TopologyAssignment{
+					Levels: defaultOneLevel,
+					Domains: []tas.TopologyDomainAssignment{
+						{Count: 1, Values: []string{"y1"}},
+						{Count: 1, Values: []string{"y2"}},
+						{Count: 1, Values: []string{"y3"}},
+					},
+				},
+				wantDomainFailover: &DomainFailover{Level: tasRackLabel, From: "r1", To: "r2", MinCount: 2, HealthyCount: 1, AdmittedCount: 3, Count: 3},
+			}},
+		},
+		"domain failover: a reduced count never goes below the minimum": {
+			// r2 and r3 hold one node each, below the minimum of 2.
+			featureGates: domainFailoverGates,
+			nodes:        domainFailoverNodes(true, 1, 1),
+			pods:         []corev1.Pod{*domainFailoverFillerPod("x3")},
+			levels:       []string{tasRackLabel, corev1.LabelHostname},
+			workload:     domainFailoverWorkload(true, "x1", "x2"),
+			podSets: []PodSetTestCase{{
+				podSetName:           "main",
+				topologyRequest:      &kueue.PodSetTopologyRequest{Required: new(string(tasRackLabel))},
+				requests:             map[corev1.ResourceName]int64{"example.com/gpu": 1},
+				count:                3,
+				minCount:             new(int32(2)),
+				reducedCountFailover: true,
+				wantReason: `cannot replace the node in topology domain "r1", which can run 1 of the 2 pods PodSet main needs at minimum, ` +
+					`and no other domain fits its 3 pods, nor as few as its minimum of 2: topology "default" allows to fit only 1 out of 3 pod(s). Total nodes: 3; excluded: resource "example.com/gpu": 1`,
+			}},
+		},
+		"domain failover: a PodSet without a minimum count is not placed at fewer pods": {
+			featureGates: domainFailoverGates,
+			nodes:        domainFailoverNodes(true, 2, 2),
+			pods:         []corev1.Pod{*domainFailoverFillerPod("x3")},
+			levels:       []string{tasRackLabel, corev1.LabelHostname},
+			workload:     domainFailoverWorkload(true, "x1", "x2"),
+			podSets: []PodSetTestCase{{
+				podSetName:           "main",
+				topologyRequest:      &kueue.PodSetTopologyRequest{Required: new(string(tasRackLabel))},
+				requests:             map[corev1.ResourceName]int64{"example.com/gpu": 1},
+				count:                3,
+				reducedCountFailover: true,
+				wantReason: `cannot replace the node in topology domain "r1", which can run 1 of the 3 pods PodSet main needs at minimum, ` +
+					`and no other domain fits its 3 pods: topology "default" allows to fit only 2 out of 3 pod(s). Total nodes: 5; excluded: resource "example.com/gpu": 1`,
+			}},
+		},
 		"domain failover: a PodSet whose whole domain failed moves": {
 			featureGates: domainFailoverGates,
 			nodes:        domainFailoverNodes(false, 3, 3),
@@ -743,7 +853,7 @@ func TestFindTopologyAssignments(t *testing.T) {
 						{Count: 1, Values: []string{"y3"}},
 					},
 				},
-				wantDomainFailover: &DomainFailover{Level: tasRackLabel, From: "", To: "r2", MinCount: 2, HealthyCount: 0},
+				wantDomainFailover: &DomainFailover{Level: tasRackLabel, From: "", To: "r2", MinCount: 2, HealthyCount: 0, AdmittedCount: 3, Count: 3},
 			}},
 		},
 		"domain failover: a PodSet without the opt-in annotation waits for its repair": {
@@ -12614,10 +12724,11 @@ func TestFindTopologyAssignments(t *testing.T) {
 								},
 							},
 						},
-						PodSetUpdates:      ps.podSetUpdates,
-						SinglePodRequests:  resources.NewRequestsFromMap(ps.requests),
-						Count:              ps.count,
-						PreviousAssignment: ps.previousAssignment,
+						PodSetUpdates:        ps.podSetUpdates,
+						SinglePodRequests:    resources.NewRequestsFromMap(ps.requests),
+						Count:                ps.count,
+						PreviousAssignment:   ps.previousAssignment,
+						ReducedCountFailover: ps.reducedCountFailover,
 					}
 					if len(ps.draBackedRequests) > 0 {
 						undelegated := resources.NewRequestsFromMap(ps.requests).Clone()

@@ -84,6 +84,7 @@ func (a *Assignment) WorkloadsTopologyRequests(log logr.Logger, wl *workload.Inf
 				a.psError(psAssignment, err)
 				continue
 			} else if psTASRequest != nil {
+				psTASRequest.ReducedCountFailover = a.ReducedCountFailover
 				tasRequests[psTASRequest.Flavor] = append(tasRequests[psTASRequest.Flavor], *psTASRequest)
 			}
 		}

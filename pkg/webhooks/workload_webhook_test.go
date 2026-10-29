@@ -811,6 +811,37 @@ func TestValidateWorkloadUpdate(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	specPath := field.NewPath("spec")
 	podSetsPath := specPath.Child("podSets")
+	domainFailoverGates := map[featuregate.Feature]bool{
+		features.TopologyAwareScheduling:                               true,
+		features.ElasticJobsViaWorkloadSlices:                          true,
+		features.ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp: true,
+		features.ElasticJobsViaWorkloadSlicesDomainFailover:            true,
+	}
+	// domainFailoverWorkload is an elastic Workload of one PodSet of 3 pods with
+	// a minimum of 2, admitted with the given count and CPU usage on the hosts.
+	domainFailoverWorkload := func(optIn bool, count int32, cpu string, unhealthyNodes []string, hosts ...string) *kueue.Workload {
+		ta := utiltestingapi.MakeTopologyAssignment([]string{corev1.LabelHostname})
+		for _, host := range hosts {
+			ta = ta.Domain(tas.TopologyDomainAssignment{Count: 1, Values: []string{host}})
+		}
+		wl := utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
+			Annotation(constants.ElasticJobAnnotation, "true").
+			PodSets(*utiltestingapi.MakePodSet("ps1", 3).SetMinimumCount(2).Request(corev1.ResourceCPU, "1").Obj()).
+			ReserveQuotaAt(utiltestingapi.MakeAdmission("cluster-queue").
+				PodSets(utiltestingapi.MakePodSetAssignment("ps1").
+					Count(count).
+					Assignment(corev1.ResourceCPU, "flavor", cpu).
+					TopologyAssignment(ta.Obj()).
+					Obj()).
+				Obj(), now).
+			UnhealthyNodes(unhealthyNodes...)
+		if optIn {
+			wl.Annotation(constants.ElasticJobDomainFailoverAnnotationKey, constants.ElasticJobDomainFailoverAnnotationValue)
+		}
+		return wl.Obj()
+	}
+	immutableAdmission := field.ErrorList{field.Invalid(field.NewPath("status", "admission"), nil, "")}.ToAggregate()
+
 	testCases := map[string]struct {
 		featureGates map[featuregate.Feature]bool
 
@@ -818,6 +849,41 @@ func TestValidateWorkloadUpdate(t *testing.T) {
 		wantErr       error
 		wantWarnings  admission.Warnings
 	}{
+		"admission count may drop to the pods a domain failover placed, down to the PodSet minimum": {
+			featureGates: domainFailoverGates,
+			before:       domainFailoverWorkload(true, 3, "3", []string{"x1", "x2"}, "x1", "x2", "x3"),
+			after:        domainFailoverWorkload(true, 2, "2", nil, "y1", "y2"),
+		},
+		"admission count may not drop below the PodSet minimum": {
+			featureGates: domainFailoverGates,
+			before:       domainFailoverWorkload(true, 3, "3", []string{"x1", "x2"}, "x1", "x2", "x3"),
+			after:        domainFailoverWorkload(true, 1, "1", nil, "y1"),
+			wantErr:      immutableAdmission,
+		},
+		"admission count may not drop without the domain failover opt-in": {
+			featureGates: domainFailoverGates,
+			before:       domainFailoverWorkload(false, 3, "3", []string{"x1", "x2"}, "x1", "x2", "x3"),
+			after:        domainFailoverWorkload(false, 2, "2", nil, "y1", "y2"),
+			wantErr:      immutableAdmission,
+		},
+		"admission count may not drop without a node to replace": {
+			featureGates: domainFailoverGates,
+			before:       domainFailoverWorkload(true, 3, "3", nil, "x1", "x2", "x3"),
+			after:        domainFailoverWorkload(true, 2, "2", nil, "y1", "y2"),
+			wantErr:      immutableAdmission,
+		},
+		"admission count may not drop to a count its topology assignment does not cover": {
+			featureGates: domainFailoverGates,
+			before:       domainFailoverWorkload(true, 3, "3", []string{"x1", "x2"}, "x1", "x2", "x3"),
+			after:        domainFailoverWorkload(true, 2, "2", nil, "y1", "y2", "y3"),
+			wantErr:      immutableAdmission,
+		},
+		"admission usage may not grow when the count drops": {
+			featureGates: domainFailoverGates,
+			before:       domainFailoverWorkload(true, 3, "3", []string{"x1", "x2"}, "x1", "x2", "x3"),
+			after:        domainFailoverWorkload(true, 2, "4", nil, "y1", "y2"),
+			wantErr:      immutableAdmission,
+		},
 		"an update may not put a workload in quota reserved with no admission": {
 			before: utiltestingapi.MakeWorkload(testWorkloadName, testWorkloadNamespace).
 				PodSets(*utiltestingapi.MakePodSet("driver", 1).Obj()).Obj(),

@@ -55,6 +55,12 @@ type Assignment struct {
 	// representativeMode is the cached representative mode for this assignment.
 	representativeMode *FlavorAssignmentMode
 
+	// ReducedCountFailover lets a PodSet that has to leave its topology domain be
+	// placed at fewer pods than its admission covers, down to its MinCount, when
+	// no domain fits the admitted count. It is carried onto the TAS requests built
+	// from this assignment.
+	ReducedCountFailover bool
+
 	// replaceWorkloadSlice identifies the workload slice that will be replaced by this workload.
 	// It is needed to correctly compute TotalRequestsFor applying (subtracting) replaced
 	// workload resources quantities.
@@ -75,6 +81,15 @@ type Assignment struct {
 	// ZeroCountFlavorFallback records why zero-count PodSets needed a flavor
 	// assignment without the capacity probe, for a warning after quota reservation.
 	ZeroCountFlavorFallback string
+}
+
+// PodSetDomainFailover returns how the named PodSet was moved to another
+// topology domain, or nil when it was not moved or is not in the assignment.
+func (a *Assignment) PodSetDomainFailover(name kueue.PodSetReference) *schdcache.DomainFailover {
+	if psa := a.podSetAssignmentByName(name); psa != nil {
+		return psa.DomainFailover
+	}
+	return nil
 }
 
 // UpdateForTASResult updates the Assignment with the TAS result

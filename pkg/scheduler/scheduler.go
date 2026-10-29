@@ -1014,7 +1014,7 @@ func (s *Scheduler) admit(ctx context.Context, e *entry, cq *schdcache.ClusterQu
 		PodSetAssignments: e.assignment.ToAPI(log),
 	}
 	if workload.NeedsSecondPass(e.Obj) {
-		keepAdmittedCounts(admission, e.Obj.Status.Admission)
+		keepAdmittedCounts(admission, e.Obj.Status.Admission, &e.assignment, s.resourceFormatter)
 	}
 
 	consideredStr := flavorassigner.FormatFlavorAssignmentAttemptsForEvents(e.assignment)
@@ -1086,8 +1086,11 @@ func (s *Scheduler) admit(ctx context.Context, e *entry, cq *schdcache.ClusterQu
 // keepAdmittedCounts carries each PodSet's admitted count and resource usage
 // into a second-pass admission. The second pass sizes its request net of
 // reclaimable pods, while the Workload webhook lets only the topology
-// assignment change on an existing admission.
-func keepAdmittedCounts(admission, admitted *kueue.Admission) {
+// assignment change on an existing admission. A PodSet moved to another
+// topology domain at fewer pods than its admission covered takes that count
+// instead, with the usage scaled down to it; the webhook allows that decrease
+// for a Workload opted into domain failover.
+func keepAdmittedCounts(admission, admitted *kueue.Admission, assignment *flavorassigner.Assignment, formatter *resources.ResourceFormatter) {
 	if admitted == nil {
 		return
 	}
@@ -1097,8 +1100,18 @@ func keepAdmittedCounts(admission, admitted *kueue.Admission) {
 		if idx < 0 {
 			continue
 		}
-		psa.Count = admitted.PodSetAssignments[idx].Count
-		psa.ResourceUsage = admitted.PodSetAssignments[idx].ResourceUsage
+		admittedPSA := &admitted.PodSetAssignments[idx]
+		psa.Count = admittedPSA.Count
+		psa.ResourceUsage = admittedPSA.ResourceUsage
+		failover := assignment.PodSetDomainFailover(psa.Name)
+		if failover == nil || failover.AdmittedCount == 0 || failover.Count >= failover.AdmittedCount {
+			continue
+		}
+		psa.Count = new(failover.Count)
+		usage := resources.NewRequestsFromResourceList(admittedPSA.ResourceUsage)
+		usage.Divide(int64(failover.AdmittedCount))
+		usage.Mul(int64(failover.Count))
+		psa.ResourceUsage = usage.ToResourceList(formatter)
 	}
 }
 
@@ -1628,6 +1641,18 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap 
 		reducer := flavorassigner.NewOrderedPodSetReducer(effectiveReducerPodSets(wl.Obj.Spec.PodSets, replaceableWorkloadSlice, mustGrow), fitsFn)
 		if _, found := reducer.Reduce(mustGrow); found {
 			assignmentPlan = *bestPartialPlan
+		}
+	}
+
+	// A PodSet whose topology domain cannot reach its minimum moves to a domain
+	// that fits its admitted count, preempting lower-priority workloads when that
+	// is what it takes, as any placement does. Only when no domain fits the
+	// admitted count, even after preemption, is it moved at fewer pods, down to
+	// its minimum.
+	if !assignmentPlan.CanFit() && assignmentPlan.Error == nil && workload.NeedsSecondPass(wl.Obj) && workload.DomainFailoverEnabled(wl.Obj) && wl.CanBePartiallyAdmitted() {
+		reducedAssignment := flvAssigner.WithReducedCountFailover().AssignFlavors(ctx, log, nil)
+		if reducedPlan := planner.Plan(ctx, &reducedAssignment); reducedPlan.CanFit() {
+			assignmentPlan = reducedPlan
 		}
 	}
 
