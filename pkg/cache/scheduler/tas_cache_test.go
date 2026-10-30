@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -70,6 +71,9 @@ type PodSetTestCase struct {
 	wantAssignment       *tas.TopologyAssignment
 	wantReason           string
 	wantDomainFailover   *DomainFailover
+	// wantDomainFailoverFailure is compared without its Reason, which is
+	// wantReason.
+	wantDomainFailoverFailure *DomainFailoverFailure
 }
 
 func TestFindTopologyAssignments(t *testing.T) {
@@ -725,6 +729,7 @@ func TestFindTopologyAssignments(t *testing.T) {
 				minCount:        new(int32(2)),
 				wantReason: `cannot replace the node in topology domain "r1", which can run 1 of the 2 pods PodSet main needs at minimum, ` +
 					`and no other domain fits its 3 pods: topology "default" allows to fit only 2 out of 3 pod(s). Total nodes: 5; excluded: resource "example.com/gpu": 1`,
+				wantDomainFailoverFailure: &DomainFailoverFailure{PodSet: "main", Level: tasRackLabel, From: "r1", MinCount: 2, HealthyCount: 1, AdmittedCount: 3},
 			}},
 		},
 		"domain failover: the PodSet moves at fewer pods when no domain fits its admitted count and a reduced count is allowed": {
@@ -816,6 +821,7 @@ func TestFindTopologyAssignments(t *testing.T) {
 				reducedCountFailover: true,
 				wantReason: `cannot replace the node in topology domain "r1", which can run 1 of the 2 pods PodSet main needs at minimum, ` +
 					`and no other domain fits its 3 pods, nor as few as its minimum of 2: topology "default" allows to fit only 1 out of 3 pod(s). Total nodes: 3; excluded: resource "example.com/gpu": 1`,
+				wantDomainFailoverFailure: &DomainFailoverFailure{PodSet: "main", Level: tasRackLabel, From: "r1", MinCount: 2, HealthyCount: 1, AdmittedCount: 3},
 			}},
 		},
 		"domain failover: a PodSet without a minimum count is not placed at fewer pods": {
@@ -832,6 +838,7 @@ func TestFindTopologyAssignments(t *testing.T) {
 				reducedCountFailover: true,
 				wantReason: `cannot replace the node in topology domain "r1", which can run 1 of the 3 pods PodSet main needs at minimum, ` +
 					`and no other domain fits its 3 pods: topology "default" allows to fit only 2 out of 3 pod(s). Total nodes: 5; excluded: resource "example.com/gpu": 1`,
+				wantDomainFailoverFailure: &DomainFailoverFailure{PodSet: "main", Level: tasRackLabel, From: "r1", MinCount: 3, HealthyCount: 1, AdmittedCount: 3},
 			}},
 		},
 		"domain failover: a PodSet whose whole domain failed moves": {
@@ -12747,8 +12754,9 @@ func TestFindTopologyAssignments(t *testing.T) {
 					flavorTASRequests = append(flavorTASRequests, tasInput)
 
 					wantPodSetResult := tasPodSetAssignmentResult{
-						FailureReason:  ps.wantReason,
-						DomainFailover: ps.wantDomainFailover,
+						FailureReason:         ps.wantReason,
+						DomainFailover:        ps.wantDomainFailover,
+						DomainFailoverFailure: ps.wantDomainFailoverFailure,
 					}
 					if ps.wantAssignment != nil {
 						wantPodSetResult.TopologyAssignment = ps.wantAssignment
@@ -12774,7 +12782,7 @@ func TestFindTopologyAssignments(t *testing.T) {
 					findOpts = append(findOpts, WithTopologySpreadCounts(tc.spreadCounts))
 				}
 				gotResult := snapshot.FindTopologyAssignmentsForFlavor(ctx, flavorTASRequests, findOpts...)
-				if diff := cmp.Diff(wantResult, gotResult); diff != "" {
+				if diff := cmp.Diff(wantResult, gotResult, cmpopts.IgnoreFields(DomainFailoverFailure{}, "Reason")); diff != "" {
 					t.Errorf("unexpected topology assignment (-want,+got): %s", diff)
 				}
 			})

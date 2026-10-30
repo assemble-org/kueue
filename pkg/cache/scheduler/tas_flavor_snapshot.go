@@ -629,6 +629,10 @@ type FailureInfo struct {
 
 	// Flavor indicates the resource flavor associated with the failure.
 	Flavor kueue.ResourceFlavorReference
+
+	// DomainFailoverFailure is set when the failure is a domain failover that
+	// found no domain for the PodSet.
+	DomainFailoverFailure *DomainFailoverFailure
 }
 
 type TASAssignmentsResult map[kueue.PodSetReference]tasPodSetAssignmentResult
@@ -637,9 +641,10 @@ func (r TASAssignmentsResult) Failure() *FailureInfo {
 	for psName, psAssignment := range r {
 		if psAssignment.FailureReason != "" {
 			return &FailureInfo{
-				PodSetName: psName,
-				Reason:     psAssignment.FailureReason,
-				Flavor:     psAssignment.Flavor,
+				PodSetName:            psName,
+				Reason:                psAssignment.FailureReason,
+				Flavor:                psAssignment.Flavor,
+				DomainFailoverFailure: psAssignment.DomainFailoverFailure,
 			}
 		}
 	}
@@ -653,6 +658,9 @@ type tasPodSetAssignmentResult struct {
 	// DomainFailover is set when the assignment places the PodSet in another
 	// topology domain than the one its members were running in.
 	DomainFailover *DomainFailover
+	// DomainFailoverFailure is set when the PodSet had to leave its topology
+	// domain and no domain could take it.
+	DomainFailoverFailure *DomainFailoverFailure
 }
 
 // DomainFailover records a second-pass placement that left the topology
@@ -690,6 +698,30 @@ func (f *DomainFailover) Message(podSet kueue.PodSetReference) string {
 	}
 	return fmt.Sprintf("PodSet %s moved from %s %q to %q%s: %q can run %d of the %d pods the PodSet needs at minimum",
 		podSet, f.Level, f.From, f.To, placed, f.From, f.HealthyCount, f.MinCount)
+}
+
+// DomainFailoverFailure records a second pass that found no topology domain
+// for a PodSet whose domain can no longer host its minimum count: none fits
+// the admitted count, nor any count down to the minimum when the request
+// allows fewer. Preemption is weighed by the caller, so this is final only
+// once no preemption can make the PodSet fit either.
+type DomainFailoverFailure struct {
+	// PodSet is the PodSet that could not be placed.
+	PodSet kueue.PodSetReference
+	// Level is the topology level the PodSet requires.
+	Level string
+	// From is the domain the members were running in. It is empty when no
+	// node of that domain remains in the topology.
+	From utiltas.TopologyDomainID
+	// MinCount is the fewest pods the PodSet can run with.
+	MinCount int32
+	// HealthyCount is how many pods From could still run: its members on
+	// healthy nodes plus its free capacity.
+	HealthyCount int32
+	// AdmittedCount is how many pods the PodSet's admission covers.
+	AdmittedCount int32
+	// Reason is the placement failure as reported for the PodSet.
+	Reason string
 }
 
 type FlavorTASRequests []TASPodSetRequests
@@ -972,8 +1004,8 @@ func (s *TASFlavorSnapshot) FindTopologyAssignmentsForFlavor(ctx context.Context
 				// We deepCopy the existing TopologyAssignment, so if we delete unwanted domain,
 				// And there is no fit, we have the original newAssignment to retry with
 				existingAssignment := psa.TopologyAssignment
-				newAssignment, replacementAssignment, failover, reason := s.findReplacementAssignment(ctx, &tr, utiltas.InternalFrom(existingAssignment), opts.workload, assumedUsage)
-				result[tr.PodSet.Name] = tasPodSetAssignmentResult{TopologyAssignment: newAssignment, FailureReason: reason, DomainFailover: failover}
+				newAssignment, replacementAssignment, failover, failure, reason := s.findReplacementAssignment(ctx, &tr, utiltas.InternalFrom(existingAssignment), opts.workload, assumedUsage)
+				result[tr.PodSet.Name] = tasPodSetAssignmentResult{TopologyAssignment: newAssignment, FailureReason: reason, DomainFailover: failover, DomainFailoverFailure: failure}
 				switch {
 				case reason != "":
 					return result
@@ -1050,7 +1082,8 @@ func findLeaderAndWorkers(trs FlavorTASRequests) (*TASPodSetRequests, TASPodSetR
 // it return new corrected topologyAssignment, a replacement topologyAssignment used to patched the old, faulty one, and
 // reason if finding fails. When the PodSet is moved to another topology domain
 // instead (see domainFailover), both assignments are the PodSet's new one and
-// the move is described by the returned DomainFailover.
+// the move is described by the returned DomainFailover; when it had to move and
+// no domain could take it, the returned DomainFailoverFailure says so.
 // It is only reachable for workloads with hostname-level assignments, as
 // UnhealthyNodes is populated behind an IsLowestLevelHostname gate; the
 // assignment values here and in its helpers are therefore node-scoped even
@@ -1061,7 +1094,7 @@ func (s *TASFlavorSnapshot) findReplacementAssignment(
 	existingAssignment *utiltas.TopologyAssignment,
 	wl *workload.Info,
 	assumedUsage *assumedUsage,
-) (*utiltas.TopologyAssignment, *utiltas.TopologyAssignment, *DomainFailover, string) {
+) (*utiltas.TopologyAssignment, *utiltas.TopologyAssignment, *DomainFailover, *DomainFailoverFailure, string) {
 	headNodeName := workload.FirstUnhealthyNodeName(wl.Obj)
 	// The request count is net of reclaimable pods, while the admission's count
 	// cannot change; a PodSet moving to another domain is placed afresh at the
@@ -1070,7 +1103,7 @@ func (s *TASFlavorSnapshot) findReplacementAssignment(
 	tr.Count = deleteDomain(existingAssignment, headNodeName)
 	ignoreNodes := s.replacementIgnoreNodes(wl.Obj, existingAssignment)
 	if isStale, staleDomain := s.isTopologyAssignmentStaleIgnoringNodes(existingAssignment, ignoreNodes); isStale {
-		return nil, nil, nil, fmt.Sprintf("Cannot replace the node, because the existing topologyAssignment is invalid, as it contains the stale domain %v", staleDomain)
+		return nil, nil, nil, nil, fmt.Sprintf("Cannot replace the node, because the existing topologyAssignment is invalid, as it contains the stale domain %v", staleDomain)
 	}
 	requiredReplacementDomain := s.requiredReplacementDomain(tr, existingAssignment)
 	if isRequired(tr.PodSet.TopologyRequest) && len(existingAssignment.Domains) > 0 && requiredReplacementDomain == "" {
@@ -1079,12 +1112,12 @@ func (s *TASFlavorSnapshot) findReplacementAssignment(
 			// replacement, so the domain cannot run a single member.
 			return s.domainFailover(ctx, tr, admittedCount, "", 0, wl, assumedUsage)
 		}
-		return nil, nil, nil, "cannot replace the node: required topology domain of the remaining assignment cannot be determined"
+		return nil, nil, nil, nil, "cannot replace the node: required topology domain of the remaining assignment cannot be determined"
 	}
 	trCopy := *tr
 	sliceSize, reason := getSliceSizeWithSinglePodAsDefault(tr.PodSet.TopologyRequest)
 	if reason != "" {
-		return nil, nil, nil, reason
+		return nil, nil, nil, nil, reason
 	}
 	if slicesRequested(tr.PodSet.TopologyRequest) && requiredReplacementDomain != "" && (tr.Count%sliceSize != 0) {
 		trCopy.PodSet = tr.PodSet.DeepCopy()
@@ -1113,16 +1146,16 @@ func (s *TASFlavorSnapshot) findReplacementAssignment(
 		if requiredReplacementDomain != "" && s.domainFailoverEnabled(tr, wl) {
 			healthyCount, found, capacityReason := s.healthyCapacityInDomain(ctx, trCopy, existingAssignment, requiredReplacementDomain, wl, assumedUsage)
 			if capacityReason != "" {
-				return nil, nil, nil, capacityReason
+				return nil, nil, nil, nil, capacityReason
 			}
 			if found && healthyCount < podSetMinCount(tr.PodSet, admittedCount) {
 				return s.domainFailover(ctx, tr, admittedCount, requiredReplacementDomain, healthyCount, wl, assumedUsage)
 			}
 		}
-		return nil, nil, nil, reason
+		return nil, nil, nil, nil, reason
 	}
 	if replacementAssignment == nil || len(replacementAssignment[tr.PodSet.Name].Domains) == 0 {
-		return nil, nil, nil, fmt.Sprintf("cannot find replacement assignment for unhealthy node: %v", headNodeName)
+		return nil, nil, nil, nil, fmt.Sprintf("cannot find replacement assignment for unhealthy node: %v", headNodeName)
 	}
 	newAssignment := s.mergeTopologyAssignments(replacementAssignment[tr.PodSet.Name], existingAssignment)
 	// Merging orders the domains by their level values, which may leave the
@@ -1132,9 +1165,9 @@ func (s *TASFlavorSnapshot) findReplacementAssignment(
 		// The repair could not keep the slices whole, which the rank-based
 		// ungating relies on. Reject it and let the workload be rescheduled
 		// from scratch instead of publishing a misaligned assignment.
-		return nil, nil, nil, fmt.Sprintf("cannot replace the node %v without splitting a PodSet slice", wl.Obj.Status.UnhealthyNodes[0].Name)
+		return nil, nil, nil, nil, fmt.Sprintf("cannot replace the node %v without splitting a PodSet slice", wl.Obj.Status.UnhealthyNodes[0].Name)
 	}
-	return newAssignment, replacementAssignment[tr.PodSet.Name], nil, ""
+	return newAssignment, replacementAssignment[tr.PodSet.Name], nil, nil, ""
 }
 
 // domainFailoverEnabled reports whether tr's PodSet may leave the topology
@@ -1201,7 +1234,8 @@ func (s *TASFlavorSnapshot) requiredLevelIdx(tr *TASPodSetRequests) (int, bool) 
 // down to its minimum that a domain fits. The domain the members ran in cannot
 // be chosen: it holds fewer free pods than the PodSet's minimum and its own
 // members still occupy their nodes in the snapshot. As with node replacement,
-// the PodSet is not re-spread.
+// the PodSet is not re-spread. When no domain fits, the returned
+// DomainFailoverFailure records what was tried and the reason explains it.
 func (s *TASFlavorSnapshot) domainFailover(
 	ctx context.Context,
 	tr *TASPodSetRequests,
@@ -1210,7 +1244,7 @@ func (s *TASFlavorSnapshot) domainFailover(
 	healthyCount int32,
 	wl *workload.Info,
 	assumedUsage *assumedUsage,
-) (*utiltas.TopologyAssignment, *utiltas.TopologyAssignment, *DomainFailover, string) {
+) (*utiltas.TopologyAssignment, *utiltas.TopologyAssignment, *DomainFailover, *DomainFailoverFailure, string) {
 	minCount := podSetMinCount(tr.PodSet, admittedCount)
 	full := *tr
 	full.PreviousAssignment = nil
@@ -1238,19 +1272,29 @@ func (s *TASFlavorSnapshot) domainFailover(
 			moved, _ = place(count)
 		}
 	}
+	levelIdx, _ := s.requiredLevelIdx(tr)
 	if moved == nil {
 		fewer := ""
 		if tr.ReducedCountFailover && minCount < admittedCount {
 			fewer = fmt.Sprintf(", nor as few as its minimum of %d", minCount)
 		}
-		if from == "" {
-			return nil, nil, nil, fmt.Sprintf("cannot replace the node: no node of the required topology domain of PodSet %s remains, and no other domain fits its %d pods%s: %s",
-				tr.PodSet.Name, admittedCount, fewer, reason)
+		failure := &DomainFailoverFailure{
+			PodSet:        tr.PodSet.Name,
+			Level:         s.levelKeys[levelIdx],
+			From:          from,
+			MinCount:      minCount,
+			HealthyCount:  healthyCount,
+			AdmittedCount: admittedCount,
 		}
-		return nil, nil, nil, fmt.Sprintf("cannot replace the node in topology domain %q, which can run %d of the %d pods PodSet %s needs at minimum, and no other domain fits its %d pods%s: %s",
-			from, healthyCount, minCount, tr.PodSet.Name, admittedCount, fewer, reason)
+		if from == "" {
+			failure.Reason = fmt.Sprintf("cannot replace the node: no node of the required topology domain of PodSet %s remains, and no other domain fits its %d pods%s: %s",
+				tr.PodSet.Name, admittedCount, fewer, reason)
+		} else {
+			failure.Reason = fmt.Sprintf("cannot replace the node in topology domain %q, which can run %d of the %d pods PodSet %s needs at minimum, and no other domain fits its %d pods%s: %s",
+				from, healthyCount, minCount, tr.PodSet.Name, admittedCount, fewer, reason)
+		}
+		return nil, nil, nil, failure, failure.Reason
 	}
-	levelIdx, _ := s.requiredLevelIdx(tr)
 	failover := &DomainFailover{
 		Level:         s.levelKeys[levelIdx],
 		From:          from,
@@ -1260,7 +1304,7 @@ func (s *TASFlavorSnapshot) domainFailover(
 		AdmittedCount: admittedCount,
 		Count:         count,
 	}
-	return moved, moved, failover, ""
+	return moved, moved, failover, nil, ""
 }
 
 func (s *TASFlavorSnapshot) replacementIgnoreNodes(

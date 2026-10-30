@@ -1477,6 +1477,52 @@ func TestScheduleForTAS(t *testing.T) {
 					Message(`PodSet one moved from cloud.provider.com/rack "b1,rb" to "b1,rc" at 2 of its 3 pods: "b1,rb" can run 1 of the 2 pods the PodSet needs at minimum`).Obj(),
 			},
 		},
+		"second pass; domain failover finds no domain at the minimum and nothing to preempt: the workload is evicted": {
+			// foo runs 3 pods in rack rb with a minimum of 2; b1 and b2 failed, so
+			// rb can run 1. Rack rc has one node, so no domain fits even the
+			// minimum and there is nothing to preempt for it. Retrying cannot
+			// place foo, and its admission would keep its quota from everyone
+			// else, so it is evicted and requeued. The admission stays until the
+			// job controller finishes the eviction.
+			featureGates: map[featuregate.Feature]bool{
+				features.ElasticJobsViaWorkloadSlicesDomainFailover: true,
+				features.TASFailedNodeReplacementFailFast:           false,
+				features.TASReplaceMultipleFailedNodes:              true,
+			},
+			nodes: []corev1.Node{
+				failoverRackNode("b1", "rb"), failoverRackNode("b2", "rb"), failoverRackNode("b3", "rb"),
+				failoverRackNode("c1", "rc"),
+			},
+			topologies:      []kueue.Topology{defaultThreeLevelTopology},
+			resourceFlavors: []kueue.ResourceFlavor{defaultTASThreeLevelFlavor},
+			clusterQueues: []kueue.ClusterQueue{
+				*utiltestingapi.MakeClusterQueue("tas-main").
+					Preemption(kueue.ClusterQueuePreemption{WithinClusterQueue: kueue.PreemptionPolicyLowerPriority}).
+					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("tas-default").Resource(corev1.ResourceCPU, "4").Obj()).
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltestingapi.MakeWorkload("foo", "default").
+					Annotation(constants.ElasticJobAnnotation, "true").
+					Annotation(constants.ElasticJobDomainFailoverAnnotationKey, constants.ElasticJobDomainFailoverAnnotationValue).
+					UnhealthyNodes("b1", "b2").
+					Queue("tas-main").
+					PodSets(*utiltestingapi.MakePodSet("one", 3).RequiredTopologyRequest(tasRackLabel).SetMinimumCount(2).Request(corev1.ResourceCPU, "1").Obj()).
+					ReserveQuotaAt(utiltestingapi.MakeAdmission("tas-main").PodSets(failoverAdmission("one", "b1", "b2", "b3").Obj()).Obj(), now).
+					AdmittedAt(true, now).
+					Obj(),
+			},
+			wantNewAssignments: map[workload.Reference]kueue.Admission{
+				"default/foo": *utiltestingapi.MakeAdmission("tas-main").PodSets(failoverAdmission("one", "b1", "b2", "b3").Obj()).Obj(),
+			},
+			wantEvents: []utiltesting.EventRecord{
+				utiltesting.MakeEventRecord("default", "foo", "EvictedDueToNodeFailures", corev1.EventTypeNormal).
+					Message(`Workload was evicted as no topology domain fits PodSet one at its minimum of 2 pods: ` +
+						`cannot replace the node in topology domain "b1,rb", which can run 1 of the 2 pods PodSet one needs at minimum, ` +
+						`and no other domain fits its 3 pods, nor as few as its minimum of 2: topology "tas-three-level" allows to fit only 1 out of 3 pod(s). ` +
+						`Total nodes: 4; excluded: resource "cpu": 3`).Obj(),
+			},
+		},
 		"second pass; domain failover preempts for the admitted count before moving the PodSet at fewer pods": {
 			// Rack rc fits the 3 admitted pods once its lower-priority occupant is
 			// gone, so the second pass preempts it instead of settling for 2 pods.
