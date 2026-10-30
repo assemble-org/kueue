@@ -61,6 +61,11 @@ type Assignment struct {
 	// from this assignment.
 	ReducedCountFailover bool
 
+	// DomainFailoverFailure is set when a PodSet had to leave its topology
+	// domain and no domain could take it, which is why the assignment does
+	// not fit.
+	DomainFailoverFailure *schdcache.DomainFailoverFailure
+
 	// replaceWorkloadSlice identifies the workload slice that will be replaced by this workload.
 	// It is needed to correctly compute TotalRequestsFor applying (subtracting) replaced
 	// workload resources quantities.

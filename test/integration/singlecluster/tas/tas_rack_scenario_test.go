@@ -289,6 +289,19 @@ func (s *rackScenario) failNode(name string) {
 	})
 }
 
+// recoverNode marks the node Ready again, so the TAS node controller and the
+// scheduler's cache treat it as healthy.
+func (s *rackScenario) recoverNode(name string) {
+	ginkgo.GinkgoHelper()
+	node := &corev1.Node{}
+	gomega.Expect(k8sClient.Get(ctx, apitypes.NamespacedName{Name: name}, node)).Should(gomega.Succeed())
+	behavioral.SetNodeCondition(ctx, k8sClient, node, &corev1.NodeCondition{
+		Type:               corev1.NodeReady,
+		Status:             corev1.ConditionTrue,
+		LastTransitionTime: metav1.Now(),
+	})
+}
+
 // expectUnhealthyNodes waits until the admitted Workload records exactly these
 // unhealthy nodes, in this order.
 func (s *rackScenario) expectUnhealthyNodes(wl *kueue.Workload, names ...string) {
@@ -304,9 +317,9 @@ func (s *rackScenario) expectUnhealthyNodes(wl *kueue.Workload, names ...string)
 	}, behavioral.LongTimeout, behavioral.Interval).Should(gomega.Succeed())
 }
 
-// expectPreempted waits until each Workload is evicted by preemption. The wait
+// expectEvictedFor waits until each Workload is evicted for the reason. The wait
 // is long because a second pass retries with a backoff of up to 30 seconds.
-func (s *rackScenario) expectPreempted(wls ...*kueue.Workload) {
+func (s *rackScenario) expectEvictedFor(reason string, wls ...*kueue.Workload) {
 	ginkgo.GinkgoHelper()
 	gomega.Eventually(func(g gomega.Gomega) {
 		for _, wl := range wls {
@@ -315,9 +328,26 @@ func (s *rackScenario) expectPreempted(wls ...*kueue.Workload) {
 			cond := apimeta.FindStatusCondition(updated.Status.Conditions, kueue.WorkloadEvicted)
 			g.Expect(cond).NotTo(gomega.BeNil(), "workload %s is not evicted", wl.Name)
 			g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionTrue), "workload %s is not evicted", wl.Name)
-			g.Expect(cond.Reason).To(gomega.Equal(kueue.WorkloadPreempted), "workload %s was evicted for another reason", wl.Name)
+			g.Expect(cond.Reason).To(gomega.Equal(reason), "workload %s was evicted for another reason: %s", wl.Name, cond.Message)
 		}
 	}, behavioral.LongTimeout, behavioral.Interval).Should(gomega.Succeed())
+}
+
+// expectPreempted waits until each Workload is evicted by preemption.
+func (s *rackScenario) expectPreempted(wls ...*kueue.Workload) {
+	ginkgo.GinkgoHelper()
+	s.expectEvictedFor(kueue.WorkloadPreempted, wls...)
+}
+
+// expectAdmittedNotEvicted asserts that the Workload stays admitted without an
+// eviction for long enough to cover a second-pass retry.
+func (s *rackScenario) expectAdmittedNotEvicted(wl *kueue.Workload) {
+	ginkgo.GinkgoHelper()
+	gomega.Consistently(func(g gomega.Gomega) {
+		g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), wl)).To(gomega.Succeed())
+		g.Expect(workload.IsAdmitted(wl)).To(gomega.BeTrue(), "workload %s is no longer admitted", wl.Name)
+		g.Expect(apimeta.IsStatusConditionTrue(wl.Status.Conditions, kueue.WorkloadEvicted)).To(gomega.BeFalse(), "workload %s was evicted", wl.Name)
+	}, behavioral.LongConsistentDuration, behavioral.Interval).Should(gomega.Succeed())
 }
 
 // remove deletes the Workloads the way their jobs' removal would, clearing the
@@ -569,6 +599,51 @@ var _ = ginkgo.Describe("Topology Aware Scheduling rack scenarios", ginkgo.Order
 					g.Expect(apimeta.IsStatusConditionTrue(occupant.Status.Conditions, kueue.WorkloadEvicted)).To(gomega.BeFalse(), "occupant %s was evicted", occupant.Name)
 				}
 			}, behavioral.ConsistentDuration, behavioral.Interval).Should(gomega.Succeed())
+		})
+	})
+
+	// With one rack in the cluster there is no rack to move to. Losing a third node
+	// leaves the role below its minimum for as long as the nodes are down, so the
+	// job is evicted rather than kept admitted with quota it cannot use, and is
+	// admitted again once the rack is whole.
+	ginkgo.It("evicts a one-role job whose only rack drops below the minimum and admits it again once the rack recovers", framework.SlowSpec, func() {
+		s = newRackScenario(ns, rackSpec{"a", 18})
+		var job *kueue.Workload
+		ginkgo.By("admitting a one-role job of 18 nodes with a minimum of 16 into rack a", func() {
+			job = s.admit(s.elasticJob("job", 1, 18, 16, jobPriority))
+			s.expectRoleInRack(job, "r0", "a", behavioral.Timeout)
+		})
+		failed := s.nodesOfRack["a"][:3]
+
+		ginkgo.By("failing two nodes one at a time, which keeps the role at or above its minimum of 16 and admitted", func() {
+			for i := range 2 {
+				before := s.eventCountNow(job, "SecondPassFailed")
+				s.failNode(failed[i])
+				s.expectUnhealthyNodes(job, failed[:i+1]...)
+				s.expectEventSince(job, "SecondPassFailed", before)
+				s.expectAdmittedNotEvicted(job)
+			}
+		})
+
+		ginkgo.By("failing a third node, which drops the role to 15 with no rack to move to", func() {
+			s.failNode(failed[2])
+		})
+
+		ginkgo.By("evicting the job for its failed nodes", func() {
+			s.expectEvictedFor(kueue.WorkloadEvictedDueToNodeFailures, job)
+		})
+
+		ginkgo.By("recovering the nodes and releasing the job's reservation, as its job controller would", func() {
+			for _, name := range failed {
+				s.recoverNode(name)
+			}
+			behavioral.FinishEvictionForWorkloads(ctx, k8sClient, job)
+		})
+
+		ginkgo.By("admitting the job again into rack a at its full count of 18", func() {
+			s.expectRoleInRack(job, "r0", "a", behavioral.LongTimeout)
+			gomega.Expect(roleCount(job, "r0")).To(gomega.Equal(int32(18)))
+			s.expectUnhealthyNodes(job)
 		})
 	})
 
