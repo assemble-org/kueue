@@ -510,6 +510,18 @@ func (s *Scheduler) processEntry(
 		return
 	}
 
+	// A PodSet that had to leave its topology domain and fits nowhere, at any
+	// count down to its minimum and with nothing to preempt, is not placed by
+	// retrying: only nodes returning or other workloads finishing change that.
+	// An admission held meanwhile keeps the whole Workload's quota from
+	// everyone else, so the Workload is evicted and requeued instead, to be
+	// admitted again wherever its minimum fits. A pending preemption is still
+	// a way in and keeps waiting.
+	if failure := e.assignment.DomainFailoverFailure; failure != nil && (mode == flavorassigner.NoFit || (mode == flavorassigner.Preempt && len(e.preemptionTargets) == 0)) {
+		s.handleFailedDomainFailover(ctx, log, e, failure)
+		return
+	}
+
 	if mode == flavorassigner.NoFit {
 		e.requeueReason = qcache.RequeueReasonNoFit
 		log.V(3).Info("Skipping workload as FlavorAssigner assigned NoFit mode")
@@ -614,6 +626,14 @@ func shouldFailFastTASReplacement(wl *kueue.Workload, mode flavorassigner.Flavor
 
 func (s *Scheduler) handleFailedTASReplacement(ctx context.Context, log logr.Logger, e *entry) {
 	if err := s.evictWorkloadAfterFailedTASReplacement(ctx, log, e.Obj.DeepCopy()); client.IgnoreNotFound(err) != nil {
+		log.V(2).Error(err, "Failed to evict workload")
+		return
+	}
+	e.markEvicted()
+}
+
+func (s *Scheduler) handleFailedDomainFailover(ctx context.Context, log logr.Logger, e *entry, failure *schdcache.DomainFailoverFailure) {
+	if err := s.evictWorkloadAfterFailedDomainFailover(ctx, log, e.Obj.DeepCopy(), failure); client.IgnoreNotFound(err) != nil {
 		log.V(2).Error(err, "Failed to evict workload")
 		return
 	}
@@ -986,6 +1006,20 @@ func (s *Scheduler) evictWorkloadAfterFailedTASReplacement(ctx context.Context, 
 		workloadevict.WithLooseOnApply(), workloadevict.WithRetryOnConflict(),
 	); err != nil {
 		return fmt.Errorf("failed to evict workload after failed try to find a replacement for unhealthy nodes: %s, %w", unhealthyNodesCsv, err)
+	}
+	return nil
+}
+
+func (s *Scheduler) evictWorkloadAfterFailedDomainFailover(ctx context.Context, log logr.Logger, wl *kueue.Workload, failure *schdcache.DomainFailoverFailure) error {
+	log.V(3).Info("Evicting workload: no topology domain fits a PodSet at its minimum", "podSet", failure.PodSet, "level", failure.Level, "from", failure.From,
+		"minCount", failure.MinCount, "healthyCount", failure.HealthyCount, "admittedCount", failure.AdmittedCount)
+	msg := fmt.Sprintf("Workload was evicted as no topology domain fits PodSet %s at its minimum of %d pods: %s", failure.PodSet, failure.MinCount, failure.Reason)
+	exposeLqMetrics := s.cache.ShouldExposeLocalQueueMetricsForWorkload(log, wl)
+	if err := workloadevict.Evict(
+		ctx, s.client, s.recorder, wl, kueue.WorkloadEvictedDueToNodeFailures, msg, "", s.clock, exposeLqMetrics, s.roleTracker, s.customLabels,
+		workloadevict.WithLooseOnApply(), workloadevict.WithRetryOnConflict(),
+	); err != nil {
+		return fmt.Errorf("failed to evict workload after no topology domain fit PodSet %s: %w", failure.PodSet, err)
 	}
 	return nil
 }
@@ -1651,7 +1685,10 @@ func (s *Scheduler) getAssignments(ctx context.Context, wl *workload.Info, snap 
 	// its minimum.
 	if !assignmentPlan.CanFit() && assignmentPlan.Error == nil && workload.NeedsSecondPass(wl.Obj) && workload.DomainFailoverEnabled(wl.Obj) && wl.CanBePartiallyAdmitted() {
 		reducedAssignment := flvAssigner.WithReducedCountFailover().AssignFlavors(ctx, log, nil)
-		if reducedPlan := planner.Plan(ctx, &reducedAssignment); reducedPlan.CanFit() {
+		// A reduced attempt that fails too is the one to keep: its failure says
+		// the PodSet fits nowhere at any count down to its minimum, which is
+		// what processEntry evicts on and what the Workload is told.
+		if reducedPlan := planner.Plan(ctx, &reducedAssignment); reducedPlan.CanFit() || (reducedPlan.Error == nil && reducedAssignment.DomainFailoverFailure != nil) {
 			assignmentPlan = reducedPlan
 		}
 	}

@@ -190,8 +190,11 @@ const (
 	// replacement cannot be placed in that domain and the domain can no longer
 	// host the PodSet's minimum count, the second pass places the whole PodSet
 	// in another domain that fits it; the members left behind are released by
-	// the job. Opted into per job with the elastic-job-domain-failover
-	// annotation. Requires ElasticJobsViaWorkloadSlicesWithRequiredTopology.
+	// the job. When no domain fits the PodSet at any count down to its
+	// minimum, with nothing to preempt, the Workload is evicted (reason
+	// NodeFailures) so its quota is released, and requeued. Opted into per job
+	// with the elastic-job-domain-failover annotation. Requires
+	// ElasticJobsViaWorkloadSlicesWithRequiredTopology.
 	ElasticJobsViaWorkloadSlicesDomainFailover featuregate.Feature = "ElasticJobsViaWorkloadSlicesDomainFailover"
 
 	// owner: @sohankunkerkar

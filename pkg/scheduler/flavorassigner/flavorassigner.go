@@ -514,6 +514,7 @@ func (a *FlavorAssigner) AssignTopology(ctx context.Context, log logr.Logger, as
 				Preempt,
 				*NewStatus(failure.Reason),
 			)
+			assignment.DomainFailoverFailure = failure.DomainFailoverFailure
 		} else {
 			// All PodSets fit, we just update the TopologyAssignments
 			assignment.UpdateForTASResult(log, a.cq, a.wl, result)
