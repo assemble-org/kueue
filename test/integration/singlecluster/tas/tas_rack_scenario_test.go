@@ -647,6 +647,47 @@ var _ = ginkgo.Describe("Topology Aware Scheduling rack scenarios", ginkgo.Order
 		})
 	})
 
+	// Two roles in racks a and b, and a third rack too small for a role. When a role
+	// drops below its minimum and no rack can take it even at the floor, the whole
+	// Workload is evicted, the healthy role included: the job cannot run with one
+	// role below its floor, and holding the other role's rack would keep its quota
+	// from everyone else. The job is admitted again once two racks fit it.
+	ginkgo.It("evicts a two-role job, healthy role included, when one role drops below the minimum and no rack can take it", framework.SlowSpec, func() {
+		job, _, moving, _ := loseRackB(rackSpec{"c", 15}, 0, 0)
+
+		ginkgo.By("evicting the whole job for the role that fits nowhere at its minimum of 16", func() {
+			s.expectEvictedFor(kueue.WorkloadEvictedDueToNodeFailures, job)
+			gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(job), job)).To(gomega.Succeed())
+			cond := apimeta.FindStatusCondition(job.Status.Conditions, kueue.WorkloadEvicted)
+			gomega.Expect(cond.Message).To(gomega.ContainSubstring(fmt.Sprintf("no topology domain fits PodSet %s at its minimum of 16 pods", moving)))
+		})
+
+		ginkgo.By("releasing the reservation of both roles, as the job controller would once the members are gone", func() {
+			behavioral.FinishEvictionForWorkloads(ctx, k8sClient, job)
+			gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(job), job)).To(gomega.Succeed())
+			gomega.Expect(job.Status.Admission).To(gomega.BeNil())
+		})
+
+		ginkgo.By("keeping the job pending while only rack a can hold a role", func() {
+			behavioral.ExpectWorkloadsToBePending(ctx, k8sClient, job)
+			gomega.Consistently(func(g gomega.Gomega) {
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(job), job)).To(gomega.Succeed())
+				g.Expect(workload.HasQuotaReservation(job)).To(gomega.BeFalse(), "job was admitted with only one rack of 16 or more")
+			}, behavioral.LongConsistentDuration, behavioral.Interval).Should(gomega.Succeed())
+		})
+
+		ginkgo.By("recovering the rack-b nodes, after which the job is admitted again into racks a and b at 18 per role", func() {
+			for _, name := range s.nodesOfRack["b"][:3] {
+				s.recoverNode(name)
+			}
+			behavioral.ExpectWorkloadsToBeAdmittedByKeysWithTimeout(ctx, k8sClient, behavioral.LongTimeout, client.ObjectKeyFromObject(job))
+			rackOfRole := s.expectRolesInRacks(job, "a", "b")
+			for role := range rackOfRole {
+				gomega.Expect(roleCount(job, role)).To(gomega.Equal(int32(18)), "count of PodSet %s", role)
+			}
+		})
+	})
+
 	// The second pass retries on a backoff timer instead of standing at the head of
 	// its ClusterQueue, so occupants requeued right after their eviction are admitted
 	// into rack c again before the role moves, and the role preempts them again.
